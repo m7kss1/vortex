@@ -7,6 +7,7 @@
 #include <fstream>
 #include <thread>
 #include <iostream>
+#include <atomic>
 
 #include "vortex/file.hpp"
 #include "vortex/scan.hpp"
@@ -476,4 +477,86 @@ TEST_F(VortexTest, OpenFromBuffer) {
 
     auto [ref_array, ref_schema] = ReadFirstArrayFromStream(vortex::testing::CreateTestDataStream());
     ValidateArray(array, schema, ref_array, ref_schema);
+}
+
+class TrackingReadAt : public vortex::io::VortexReadAt {
+private:
+    std::string file_path_;
+    mutable std::atomic<size_t> bytes_read_{0};
+    mutable std::atomic<size_t> read_count_{0};
+
+public:
+    explicit TrackingReadAt(std::string file_path) : file_path_(std::move(file_path)) {}
+
+    std::vector<uint8_t> ReadAt(uint64_t pos, size_t len) const override {
+        std::ifstream file(file_path_, std::ios::binary);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open file: " + file_path_);
+        }
+
+        file.seekg(pos);
+        std::vector<uint8_t> data(len);
+        file.read(reinterpret_cast<char*>(data.data()), len);
+
+        size_t actually_read = file.gcount();
+        bytes_read_.fetch_add(actually_read, std::memory_order_relaxed);
+        read_count_.fetch_add(1, std::memory_order_relaxed);
+
+        data.resize(actually_read);
+        return data;
+    }
+
+    uint64_t GetSize() const override {
+        std::ifstream file(file_path_, std::ios::binary | std::ios::ate);
+        if (!file.is_open()) {
+            throw std::runtime_error("Failed to open file: " + file_path_);
+        }
+        return file.tellg();
+    }
+
+    size_t GetBytesRead() const { return bytes_read_.load(std::memory_order_relaxed); }
+    size_t GetReadCount() const { return read_count_.load(std::memory_order_relaxed); }
+    void ResetCounters() {
+        bytes_read_.store(0, std::memory_order_relaxed);
+        read_count_.store(0, std::memory_order_relaxed);
+    }
+};
+
+TEST_F(VortexTest, OpenWithReadAtMetadataOnly) {
+    std::string large_file_path = GetTestDataPath("test_data_large.vortex");
+    constexpr size_t NUM_ROWS = 20'000;
+    auto large_stream = vortex::testing::CreateRandomDataStream(NUM_ROWS);
+    auto write_options = vortex::ffi::write_options_new();
+    vortex::ffi::write_array_stream(std::move(write_options),
+                                    reinterpret_cast<uint8_t*>(&large_stream),
+                                    large_file_path.c_str());
+
+    std::ifstream file(large_file_path, std::ios::binary | std::ios::ate);
+    ASSERT_TRUE(file.is_open()) << "Failed to open file: " << large_file_path;
+    uint64_t file_size = file.tellg();
+    file.close();
+
+    // File must be larger than minimum footer read size
+    constexpr size_t MIN_FOOTER_READ = 65'535;
+    ASSERT_GT(file_size, MIN_FOOTER_READ)
+        << "Test file must be > " << MIN_FOOTER_READ << " bytes, got " << file_size;
+
+    auto tracking_reader = std::make_unique<TrackingReadAt>(large_file_path);
+    auto *reader_ptr = tracking_reader.get();
+    auto vortex_file = vortex::VortexFile::OpenSeekable(std::move(tracking_reader));
+
+    // Verify that we only read a small portion (metadata from the end)
+    size_t bytes_read = reader_ptr->GetBytesRead();
+    size_t read_count = reader_ptr->GetReadCount();
+
+    std::cout << "Bytes read during open: " << bytes_read << ", read operations: " << read_count
+              << ", file size: " << file_size << '\n';
+
+    ASSERT_LT(bytes_read, file_size)
+        << "Should not read entire file during open";
+    ASSERT_EQ(read_count, 1)
+        << "Should perform only one read operation to fetch metadata";
+
+    // Verify the file is usable and we got the metadata correctly
+    ASSERT_EQ(vortex_file.RowCount(), NUM_ROWS);
 }

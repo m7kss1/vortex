@@ -121,5 +121,67 @@ namespace testing {
         return stream;
     }
 
+    ArrowArrayStream CreateRandomDataStream(size_t num_rows) {
+        // Create schema: struct{id: int64, data: binary}
+        nanoarrow::UniqueSchema schema;
+        ArrowSchemaInit(schema.get());
+        NANOARROW_THROW_NOT_OK(ArrowSchemaSetType(schema.get(), NANOARROW_TYPE_STRUCT));
+        NANOARROW_THROW_NOT_OK(ArrowSchemaAllocateChildren(schema.get(), 2));
+        ArrowSchemaInit(schema->children[0]);
+        ArrowSchemaInit(schema->children[1]);
+        NANOARROW_THROW_NOT_OK(ArrowSchemaSetName(schema->children[0], "id"));
+        NANOARROW_THROW_NOT_OK(ArrowSchemaSetType(schema->children[0], NANOARROW_TYPE_INT64));
+        NANOARROW_THROW_NOT_OK(ArrowSchemaSetName(schema->children[1], "data"));
+        NANOARROW_THROW_NOT_OK(ArrowSchemaSetType(schema->children[1], NANOARROW_TYPE_BINARY));
+
+        nanoarrow::UniqueArray id_field, data_field;
+        NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(id_field.get(), NANOARROW_TYPE_INT64));
+        NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(data_field.get(), NANOARROW_TYPE_BINARY));
+
+        NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(id_field.get()));
+        NANOARROW_THROW_NOT_OK(ArrowArrayStartAppending(data_field.get()));
+
+        // Each row gets 1KB of random data
+        constexpr size_t DATA_SIZE = 1024;
+        std::vector<uint8_t> random_data(DATA_SIZE);
+
+        std::srand(42);
+
+        for (size_t i = 0; i < num_rows; ++i) {
+            NANOARROW_THROW_NOT_OK(ArrowArrayAppendInt(id_field.get(), static_cast<int64_t>(i)));
+
+            for (size_t j = 0; j < DATA_SIZE; ++j) {
+                random_data[j] = static_cast<uint8_t>(std::rand() % 256);
+            }
+
+            ArrowBufferView buffer_view;
+            buffer_view.data.data = random_data.data();
+            buffer_view.size_bytes = DATA_SIZE;
+            NANOARROW_THROW_NOT_OK(ArrowArrayAppendBytes(data_field.get(), buffer_view));
+        }
+
+        NANOARROW_THROW_NOT_OK(
+            ArrowArrayFinishBuilding(id_field.get(), NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+        NANOARROW_THROW_NOT_OK(
+            ArrowArrayFinishBuilding(data_field.get(), NANOARROW_VALIDATION_LEVEL_NONE, nullptr));
+
+        nanoarrow::UniqueArray struct_array;
+        NANOARROW_THROW_NOT_OK(ArrowArrayInitFromType(struct_array.get(), NANOARROW_TYPE_STRUCT));
+        NANOARROW_THROW_NOT_OK(ArrowArrayAllocateChildren(struct_array.get(), 2));
+        struct_array->length = num_rows;
+        ArrowArrayMove(id_field.get(), struct_array->children[0]);
+        ArrowArrayMove(data_field.get(), struct_array->children[1]);
+
+        // Create stream
+        std::vector<nanoarrow::UniqueArray> arrays;
+        arrays.push_back(std::move(struct_array));
+
+        ArrowArrayStream stream;
+        nanoarrow::VectorArrayStream vector_stream(schema.get(), std::move(arrays));
+        vector_stream.ToArrayStream(&stream);
+
+        return stream;
+    }
+
 } // namespace testing
 } // namespace vortex

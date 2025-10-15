@@ -16,5 +16,10 @@ namespace testing {
     /// This stream only has one Array
     ArrowArrayStream CreateTestData1MStream();
 
+    /// Create test data with random binary data that won't compress well
+    /// Returns a stream with {id: int64, data: binary} with num_rows rows
+    /// Each binary field contains 1KB of random data
+    ArrowArrayStream CreateRandomDataStream(size_t num_rows);
+
 } // namespace testing
 } // namespace vortex
