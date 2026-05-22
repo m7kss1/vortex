@@ -23,15 +23,13 @@ use crate::dtype::DType;
 /// Programs without captures (`cacheable = true`) are safe to share via [`super::ProgramCache`].
 #[derive(Clone, Debug)]
 pub struct ExprProgram {
-    /// Flat list of opcodes. Phase 0 keeps this small (`LoadScope`, `LoadConst`, `Call`,
-    /// `Return`); later phases add stateful variants.
+    /// Flat list of opcodes executed linearly by the dispatcher.
     pub opcodes: Vec<Opcode>,
     /// Number of registers the executor must allocate before running.
     pub num_regs: u16,
     /// The register holding the program's final result. The `Return` opcode references it.
     pub result_reg: RegId,
-    /// dtype of the scope this program expects as input. Kept for safety checks and future
-    /// projection-path use; not consulted by the Phase 0 executor.
+    /// dtype of the scope this program expects as input. Kept for future type-checking use.
     pub scope_dtype: Arc<DType>,
     /// Whether this program is safe to cache and reuse across different batches with the same
     /// encoding structure. Programs containing [`super::Opcode::LoadCapture`] opcodes embed

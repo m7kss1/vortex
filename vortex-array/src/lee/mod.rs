@@ -42,7 +42,7 @@ pub use compile::compile;
 pub use execute::execute_mask_program;
 pub use execute::execute_program;
 pub use ext::ArrayRefLeeExt;
-pub use program::ExprProgram;
 pub(crate) use opcode::Opcode;
+pub use program::ExprProgram;
 pub(crate) use register::OutputRegister;
 pub(crate) use register::RegId;

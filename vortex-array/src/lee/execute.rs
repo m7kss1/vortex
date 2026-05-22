@@ -3,24 +3,18 @@
 
 //! Threaded-dispatch executor for [`ExprProgram`].
 //!
-//! Dispatch follows the LEE/PostgreSQL TurboExpr pattern: each opcode is handled by a
-//! self-contained function with the uniform signature
+//! Each opcode is handled by a self-contained function with the signature
 //! `fn(&mut ExecState) -> VortexResult<HandlerCtrl>`. Handlers are looked up through a static
-//! `HANDLERS` table indexed by [`OpTag`]; there is no centralised `match` over opcodes.
+//! `HANDLERS` table indexed by [`OpTag`]; there is no centralised match on opcodes.
 //!
-//! On stable Rust this gives us one *indirect* call per opcode plus a tight outer loop. When
+//! On stable Rust this gives us one indirect call per opcode plus a tight outer loop. When
 //! `become` / `musttail` lands, the outer loop can be removed and each handler can tail-call its
-//! successor directly — at which point this is functionally identical to PG's computed-goto
-//! `TEEO_NEXT` macro.
-//!
-//! Phase 1 adds in-place bool stateful handlers (`AllocBool`, `AndInto`, `OrInto`, `NotInto`).
-//! They mutate the destination [`OutputRegister::Bool`] scratch buffer word-by-word, without
-//! allocating a new `BoolArray` per step. The legacy `Call` handler remains as the generic
-//! fallback for every expression that doesn't reduce to a non-nullable bool reduction.
+//! successor directly — equivalent to PG's computed-goto `TEEO_NEXT` macro.
 
 use std::ops::BitAnd;
 
 use smallvec::SmallVec;
+use vortex_buffer::BitBuffer;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_mask::Mask;
@@ -35,7 +29,8 @@ use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::arrays::BoolArray;
 use crate::arrays::ConstantArray;
-use crate::scalar_fn::VecExecutionArgs;
+use crate::arrays::bool::BoolArrayExt;
+use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::fns::zip::zip_impl;
 
 /// Control-flow signal returned by each handler back to the dispatch loop.
@@ -43,6 +38,41 @@ use crate::scalar_fn::fns::zip::zip_impl;
 enum HandlerCtrl {
     Next,
     Return,
+}
+
+/// [`ExecutionArgs`] backed by an inline `SmallVec<[ArrayRef; 4]>`.
+///
+/// `into_vec()` on a `SmallVec` always heap-allocates even when the data fits inline. This type
+/// avoids that allocation for the common case of ≤4 scalar function arguments.
+struct SmallVecExecutionArgs {
+    inputs: SmallVec<[ArrayRef; 4]>,
+    row_count: usize,
+}
+
+impl SmallVecExecutionArgs {
+    fn new(inputs: SmallVec<[ArrayRef; 4]>, row_count: usize) -> Self {
+        Self { inputs, row_count }
+    }
+}
+
+impl ExecutionArgs for SmallVecExecutionArgs {
+    fn get(&self, index: usize) -> VortexResult<ArrayRef> {
+        self.inputs.get(index).cloned().ok_or_else(|| {
+            vortex_error::vortex_err!(
+                "Input index {} out of bounds (num_inputs={})",
+                index,
+                self.inputs.len()
+            )
+        })
+    }
+
+    fn num_inputs(&self) -> usize {
+        self.inputs.len()
+    }
+
+    fn row_count(&self) -> usize {
+        self.row_count
+    }
 }
 
 /// Execution state shared between handlers — closely modelled on LEE's `TurboExprState`.
@@ -64,16 +94,20 @@ type Handler = fn(&mut ExecState<'_>) -> VortexResult<HandlerCtrl>;
 /// Static handler table — indexed by `OpTag as usize`. Order **must** match the discriminants
 /// in [`OpTag`].
 static HANDLERS: [Handler; OpTag::COUNT] = [
-    h_load_scope,    // 0: LoadScope
-    h_load_const,    // 1: LoadConst
-    h_call,          // 2: Call
-    h_alloc_bool,    // 3: AllocBool
-    h_and_into,      // 4: AndInto
-    h_or_into,       // 5: OrInto
-    h_not_into,      // 6: NotInto
-    h_return,        // 7: Return
-    h_case_merge,    // 8: CaseMerge
-    h_load_capture,  // 9: LoadCapture
+    h_load_scope,          // 0:  LoadScope
+    h_load_const,          // 1:  LoadConst
+    h_call,                // 2:  Call
+    h_alloc_bool,          // 3:  AllocBool
+    h_and_into,            // 4:  AndInto
+    h_or_into,             // 5:  OrInto
+    h_not_into,            // 6:  NotInto
+    h_return,              // 7:  Return
+    h_case_merge,          // 8:  CaseMerge
+    h_load_capture,        // 9:  LoadCapture
+    h_alloc_nullable_bool, // 10: AllocNullableBool
+    h_and_into_nullable,   // 11: AndIntoNullable
+    h_or_into_nullable,    // 12: OrIntoNullable
+    h_not_into_nullable,   // 13: NotIntoNullable
 ];
 
 /// Execute a compiled program against the given scope array, returning the result array.
@@ -102,6 +136,10 @@ pub fn execute_mask_program(
     let result_mask = match result {
         OutputRegister::View(array) => array.execute::<Mask>(ctx)?,
         OutputRegister::Bool(buf) => Mask::from_buffer(buf.freeze()),
+        // Kleene nulls don't pass the filter: mask = values & validity (NULL → false).
+        OutputRegister::NullableBool { values, validity } => {
+            Mask::from_buffer(values.freeze() & validity.freeze())
+        }
         OutputRegister::Empty => vortex_bail!("lee: Return handler produced an empty register"),
     };
 
@@ -195,16 +233,15 @@ fn h_call(s: &mut ExecState<'_>) -> VortexResult<HandlerCtrl> {
     };
     let dst = *dst;
     let scalar_fn = scalar_fn.clone();
-    let arg_regs: SmallVec<[RegId; 4]> = args.iter().copied().collect();
 
-    let mut arg_arrays: SmallVec<[ArrayRef; 4]> = SmallVec::with_capacity(arg_regs.len());
-    for r in arg_regs.iter() {
+    let mut arg_arrays: SmallVec<[ArrayRef; 4]> = SmallVec::with_capacity(args.len());
+    for r in args.iter() {
         arg_arrays.push(s.regs[r.idx()].as_array_ref()?.clone());
     }
 
     let row_count = s.scope.len();
     scalar_fn.execute_into(
-        &VecExecutionArgs::new(arg_arrays.into_vec(), row_count),
+        &SmallVecExecutionArgs::new(arg_arrays, row_count),
         &mut s.regs[dst.idx()],
         s.ctx,
     )?;
@@ -240,6 +277,12 @@ fn merge_bool_into(s: &mut ExecState<'_>, dst: RegId, src: RegId, op: ByteOp) ->
     let src_bits = match &mut s.regs[src.idx()] {
         OutputRegister::View(array) => array.clone().execute::<BoolArray>(s.ctx)?.into_bit_buffer(),
         OutputRegister::Bool(buf) => buf.clone().freeze(),
+        OutputRegister::NullableBool { .. } => {
+            vortex_bail!(
+                "lee: non-nullable AndInto/OrInto received a NullableBool source; \
+                 use AndIntoNullable/OrIntoNullable for nullable operands"
+            )
+        }
         OutputRegister::Empty => vortex_bail!("lee: attempted to merge from empty register"),
     };
     let src_len = src_bits.len();
@@ -365,6 +408,215 @@ fn h_case_merge(s: &mut ExecState<'_>) -> VortexResult<HandlerCtrl> {
     let merged = zip_impl(&value_array, &dst_array, &cond_mask)?;
     s.regs[dst.idx()].assign_view(merged);
 
+    Ok(HandlerCtrl::Next)
+}
+
+/// Shared Kleene byte-level merge of `src` into `dst` (a NullableBool scratch register).
+///
+/// Implements Kleene three-valued logic for AND and OR per byte, without allocating.
+///
+/// AND formula (per byte):
+/// - `dst_val  = dst_val & src_val`
+/// - `dst_valid = (dst_valid & src_valid) | (dst_valid & !dst_val_old) | (src_valid & !src_val)`
+///
+/// OR formula (per byte):
+/// - `dst_val  = dst_val | src_val`
+/// - `dst_valid = (dst_valid & src_valid) | (dst_valid & dst_val_old) | (src_valid & src_val)`
+///
+/// When `src` is non-nullable (src_valid is all-`0xFF`), the formulas simplify:
+/// - AND: `dst_valid = dst_valid | !src_val`
+/// - OR:  `dst_valid = dst_valid | src_val`
+#[inline(always)]
+fn merge_nullable_bool_into(
+    s: &mut ExecState<'_>,
+    dst: RegId,
+    src: RegId,
+    op: NullableByteOp,
+) -> VortexResult<()> {
+    // Extract src bits before mutably borrowing dst. Both values and validity are needed.
+    // `src_validity = None` means all-valid (non-nullable source).
+    let (src_values, src_validity): (BitBuffer, Option<BitBuffer>) = match &s.regs[src.idx()] {
+        OutputRegister::View(array) => {
+            let bool_arr = array.clone().execute::<BoolArray>(s.ctx)?;
+            // Use the BoolArrayExt trait method explicitly to avoid ambiguity with
+            // TypedArrayRef::validity() which returns VortexResult<Validity>.
+            let validity = BoolArrayExt::validity(&bool_arr);
+            let validity_bits: Option<BitBuffer> = if validity.no_nulls() {
+                None
+            } else {
+                let mask = validity.execute_mask(bool_arr.len(), s.ctx)?;
+                Some(match mask {
+                    Mask::AllTrue(len) => BitBuffer::new_set(len),
+                    Mask::AllFalse(len) => BitBuffer::new_unset(len),
+                    Mask::Values(mv) => mv.bit_buffer().clone(),
+                })
+            };
+            (bool_arr.into_bit_buffer(), validity_bits)
+        }
+        OutputRegister::Bool(buf) => (buf.clone().freeze(), None),
+        OutputRegister::NullableBool { values, validity } => {
+            (values.clone().freeze(), Some(validity.clone().freeze()))
+        }
+        OutputRegister::Empty => vortex_bail!("lee: attempted to merge from empty register"),
+    };
+    let src_len = src_values.len();
+
+    // Mutably borrow dst (NullableBool) — safe because src != dst for AND/OR opcodes.
+    let (dst_values, dst_validity) = match &mut s.regs[dst.idx()] {
+        OutputRegister::NullableBool { values, validity } => (values, validity),
+        _ => vortex_bail!("lee: nullable merge target is not a NullableBool register"),
+    };
+
+    if dst_values.len() != src_len {
+        vortex_bail!(
+            "lee: nullable bool merge length mismatch (dst {} vs src {})",
+            dst_values.len(),
+            src_len
+        );
+    }
+
+    // Fast path: both buffers are byte-aligned (offset == 0).
+    if src_values.offset() == 0 && dst_values.offset() == 0 {
+        let src_val_bytes = src_values.inner().as_slice();
+        let dst_val_bytes = dst_values.as_mut_slice();
+        let dst_valid_bytes = dst_validity.as_mut_slice();
+
+        match src_validity {
+            None => {
+                // Non-nullable source: src_valid = 0xFF per byte.
+                // AND simplified: dst_valid = dst_valid | !src_val
+                // OR  simplified: dst_valid = dst_valid | src_val
+                for i in 0..dst_val_bytes.len() {
+                    let dv = dst_val_bytes[i];
+                    let sv = src_val_bytes[i];
+                    let dp = dst_valid_bytes[i];
+                    match op {
+                        NullableByteOp::And => {
+                            dst_val_bytes[i] = dv & sv;
+                            dst_valid_bytes[i] = dp | !sv;
+                        }
+                        NullableByteOp::Or => {
+                            dst_val_bytes[i] = dv | sv;
+                            dst_valid_bytes[i] = dp | sv;
+                        }
+                    }
+                }
+            }
+            Some(src_valid_buf) => {
+                let src_valid_bytes = src_valid_buf.inner().as_slice();
+                for i in 0..dst_val_bytes.len() {
+                    let dv = dst_val_bytes[i];
+                    let sv = src_val_bytes[i];
+                    let dp = dst_valid_bytes[i];
+                    let sp = src_valid_bytes[i];
+                    match op {
+                        NullableByteOp::And => {
+                            dst_val_bytes[i] = dv & sv;
+                            dst_valid_bytes[i] = (dp & sp) | (dp & !dv) | (sp & !sv);
+                        }
+                        NullableByteOp::Or => {
+                            dst_val_bytes[i] = dv | sv;
+                            dst_valid_bytes[i] = (dp & sp) | (dp & dv) | (sp & sv);
+                        }
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // Fallback for sliced/unaligned buffers: bit-by-bit.
+    for bit in 0..src_len {
+        let sv = src_values.value(bit);
+        let sp = src_validity.as_ref().is_none_or(|v| v.value(bit));
+        let dv = dst_values.value(bit);
+        let dp = dst_validity.value(bit);
+        let (new_val, new_valid) = match op {
+            NullableByteOp::And => (dv & sv, (dp & sp) | (dp & !dv) | (sp & !sv)),
+            NullableByteOp::Or => (dv | sv, (dp & sp) | (dp & dv) | (sp & sv)),
+        };
+        if new_val {
+            dst_values.set(bit);
+        } else {
+            dst_values.unset(bit);
+        }
+        if new_valid {
+            dst_validity.set(bit);
+        } else {
+            dst_validity.unset(bit);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Copy, Clone)]
+enum NullableByteOp {
+    And,
+    Or,
+}
+
+#[inline(always)]
+fn h_alloc_nullable_bool(s: &mut ExecState<'_>) -> VortexResult<HandlerCtrl> {
+    let Opcode::AllocNullableBool { dst, init } = &s.program.opcodes[s.pc] else {
+        unreachable!("h_alloc_nullable_bool dispatched on non-AllocNullableBool opcode");
+    };
+    let dst = *dst;
+    let init = *init;
+    if init
+        && dst == s.program.result_reg
+        && let Some(mask) = s.input_mask
+    {
+        s.regs[dst.idx()].assign_nullable_bool_from_mask(mask);
+        s.mask_seeded = true;
+    } else {
+        let len = s.scope.len();
+        s.regs[dst.idx()].assign_nullable_bool_filled(len, init);
+    }
+    Ok(HandlerCtrl::Next)
+}
+
+#[inline(always)]
+fn h_and_into_nullable(s: &mut ExecState<'_>) -> VortexResult<HandlerCtrl> {
+    let Opcode::AndIntoNullable { dst, src } = &s.program.opcodes[s.pc] else {
+        unreachable!("h_and_into_nullable dispatched on non-AndIntoNullable opcode");
+    };
+    let (dst, src) = (*dst, *src);
+    merge_nullable_bool_into(s, dst, src, NullableByteOp::And)?;
+    Ok(HandlerCtrl::Next)
+}
+
+#[inline(always)]
+fn h_or_into_nullable(s: &mut ExecState<'_>) -> VortexResult<HandlerCtrl> {
+    let Opcode::OrIntoNullable { dst, src } = &s.program.opcodes[s.pc] else {
+        unreachable!("h_or_into_nullable dispatched on non-OrIntoNullable opcode");
+    };
+    let (dst, src) = (*dst, *src);
+    merge_nullable_bool_into(s, dst, src, NullableByteOp::Or)?;
+    Ok(HandlerCtrl::Next)
+}
+
+#[inline(always)]
+fn h_not_into_nullable(s: &mut ExecState<'_>) -> VortexResult<HandlerCtrl> {
+    let Opcode::NotIntoNullable { reg } = &s.program.opcodes[s.pc] else {
+        unreachable!("h_not_into_nullable dispatched on non-NotIntoNullable opcode");
+    };
+    let reg = *reg;
+    let (values, _validity) = s.regs[reg.idx()].as_nullable_bool_mut()?;
+    // Flip values in place (same logic as h_not_into); validity is unchanged: NOT NULL = NULL.
+    let bit_len = values.len();
+    let bytes = values.as_mut_slice();
+    if let Some(last_idx) = bytes.len().checked_sub(1) {
+        for b in bytes[..last_idx].iter_mut() {
+            *b = !*b;
+        }
+        let valid_in_last = bit_len - last_idx * 8;
+        let mask: u8 = if valid_in_last >= 8 {
+            0xFF
+        } else {
+            (1u8 << valid_in_last) - 1
+        };
+        bytes[last_idx] = (!bytes[last_idx]) & mask;
+    }
     Ok(HandlerCtrl::Next)
 }
 
@@ -716,15 +968,16 @@ mod tests {
     /// correctly, and (c) be marked non-cacheable.
     #[test]
     fn phase_ab_dict_column_pushdown() -> VortexResult<()> {
+        use vortex_buffer::buffer;
+
         use crate::arrays::DictArray;
         use crate::expr::gt;
         use crate::expr::lit;
-        use vortex_buffer::buffer;
 
         // Build a dict-encoded column: values = [10, 20, 30], codes = [0,1,2,1,0,2].
         let values = PrimitiveArray::from_iter([10_i32, 20, 30]).into_array();
         let codes = buffer![0_u8, 1, 2, 1, 0, 2].into_array();
-        let dict_col = DictArray::try_new(codes, values).unwrap().into_array();
+        let dict_col = DictArray::try_new(codes, values)?.into_array();
         let scope = StructArray::from_fields(&[("v", dict_col)])?.into_array();
 
         // Filter: v > 15 → expected rows with values > 15: [20, 30, 20, 30] → indices [1,2,3,5].
@@ -964,6 +1217,385 @@ mod tests {
         let mut ctx_v2 = SESSION.create_execution_ctx();
         let actual = execute_mask_program(&program, &scope, &input_mask, &mut ctx_v2)?;
         assert_eq!(actual, baseline);
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Phase 4 tests: Kleene nullable bool fast path (AllocNullableBool / AndIntoNullable /
+    // OrIntoNullable / NotIntoNullable).
+    // ---------------------------------------------------------------------------------
+
+    /// Build a nullable BoolArray from parallel value and validity iterators.
+    fn nullable_bool_array(
+        values: impl IntoIterator<Item = bool>,
+        valid: impl IntoIterator<Item = bool>,
+    ) -> crate::ArrayRef {
+        let values_buf = vortex_buffer::BitBuffer::from_iter(values);
+        let validity_buf = vortex_buffer::BitBuffer::from_iter(valid);
+        let validity_array =
+            BoolArray::new(validity_buf, crate::validity::Validity::NonNullable).into_array();
+        BoolArray::new(values_buf, crate::validity::Validity::Array(validity_array)).into_array()
+    }
+
+    /// Phase 4: AND of nullable bools compiles to AllocNullableBool + AndIntoNullable opcodes.
+    #[test]
+    fn phase4_and_into_nullable_uses_kleene_opcodes() -> VortexResult<()> {
+        // col_a is nullable bool; col_b is non-nullable bool.
+        let a = nullable_bool_array([true, false, true, false], [true, true, false, false]);
+        let b = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, false, true, false]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let scope = StructArray::from_fields(&[("a", a), ("b", b)])?.into_array();
+        let expr = and(col("a"), col("b"));
+
+        let program = compile(&expr, &scope)?;
+        assert!(
+            program
+                .opcodes
+                .iter()
+                .any(|op| matches!(op, crate::lee::Opcode::AllocNullableBool { .. })),
+            "expected AllocNullableBool opcode, got: {:?}",
+            program.opcodes,
+        );
+        assert!(
+            program
+                .opcodes
+                .iter()
+                .any(|op| matches!(op, crate::lee::Opcode::AndIntoNullable { .. })),
+            "expected AndIntoNullable opcode, got: {:?}",
+            program.opcodes,
+        );
+        Ok(())
+    }
+
+    /// Phase 4: nullable AND chain produces the same result as the tree walker.
+    ///
+    /// Tests all nine Kleene AND truth table combinations:
+    ///   TRUE AND TRUE = TRUE (valid)
+    ///   TRUE AND FALSE = FALSE (valid)
+    ///   TRUE AND NULL = NULL
+    ///   FALSE AND TRUE = FALSE (valid)
+    ///   FALSE AND FALSE = FALSE (valid)
+    ///   FALSE AND NULL = FALSE (valid!) ← key Kleene case
+    ///   NULL AND TRUE = NULL
+    ///   NULL AND FALSE = FALSE (valid!) ← key Kleene case
+    ///   NULL AND NULL = NULL
+    #[test]
+    fn phase4_nullable_and_equivalence_with_tree_walker() -> VortexResult<()> {
+        // Build 9-row scope covering all Kleene AND input combinations.
+        //           a: T   T   T   F   F   F   N   N   N
+        //           b: T   F   N   T   F   N   T   F   N
+        let a_vals = [true, true, true, false, false, false, false, false, false];
+        let a_valid = [true, true, true, true, true, true, false, false, false];
+        let b_vals = [true, false, false, true, false, false, true, false, false];
+        let b_valid = [true, true, false, true, true, false, true, true, false];
+
+        let a = nullable_bool_array(a_vals, a_valid);
+        let b = nullable_bool_array(b_vals, b_valid);
+        let scope = StructArray::from_fields(&[("a", a), ("b", b)])?.into_array();
+
+        let expr = and(col("a"), col("b"));
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+
+        let program = compile(&expr, &scope)?;
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 4: nullable OR chain produces the same result as the tree walker.
+    #[test]
+    fn phase4_nullable_or_equivalence_with_tree_walker() -> VortexResult<()> {
+        //           a: T   T   T   F   F   F   N   N   N
+        //           b: T   F   N   T   F   N   T   F   N
+        let a_vals = [true, true, true, false, false, false, false, false, false];
+        let a_valid = [true, true, true, true, true, true, false, false, false];
+        let b_vals = [true, false, false, true, false, false, true, false, false];
+        let b_valid = [true, true, false, true, true, false, true, true, false];
+
+        let a = nullable_bool_array(a_vals, a_valid);
+        let b = nullable_bool_array(b_vals, b_valid);
+        let scope = StructArray::from_fields(&[("a", a), ("b", b)])?.into_array();
+
+        let expr = or(col("a"), col("b"));
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+
+        let program = compile(&expr, &scope)?;
+        assert!(
+            program
+                .opcodes
+                .iter()
+                .any(|op| matches!(op, crate::lee::Opcode::OrIntoNullable { .. })),
+            "expected OrIntoNullable, got {:?}",
+            program.opcodes,
+        );
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 4: nullable NOT produces the same result as the tree walker.
+    ///
+    /// Tests three cases: NOT TRUE = FALSE, NOT FALSE = TRUE, NOT NULL = NULL.
+    #[test]
+    fn phase4_nullable_not_equivalence_with_tree_walker() -> VortexResult<()> {
+        let a = nullable_bool_array([true, false, false], [true, true, false]);
+        let scope = StructArray::from_fields(&[("a", a)])?.into_array();
+
+        let expr = not(col("a"));
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+
+        let program = compile(&expr, &scope)?;
+        assert!(
+            program
+                .opcodes
+                .iter()
+                .any(|op| matches!(op, crate::lee::Opcode::NotIntoNullable { .. })),
+            "expected NotIntoNullable, got {:?}",
+            program.opcodes,
+        );
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 4: a chain mixing nullable and non-nullable bool columns uses the nullable path
+    /// and produces the correct result.
+    ///
+    /// `a AND b AND c` where a is nullable, b and c are non-nullable.
+    #[test]
+    fn phase4_mixed_nullable_nonnullable_and_chain() -> VortexResult<()> {
+        //      col_a: T  F  N  T
+        //      col_b: T  T  T  F  (non-nullable)
+        //      col_c: T  T  T  T  (non-nullable)
+        let col_a = nullable_bool_array([true, false, false, true], [true, true, false, true]);
+        let col_b = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, true, true, false]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let col_c = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, true, true, true]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let scope =
+            StructArray::from_fields(&[("a", col_a), ("b", col_b), ("c", col_c)])?.into_array();
+
+        let expr = and(and(col("a"), col("b")), col("c"));
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+
+        let program = compile(&expr, &scope)?;
+        let alloc_nullable_count = program
+            .opcodes
+            .iter()
+            .filter(|op| matches!(op, crate::lee::Opcode::AllocNullableBool { .. }))
+            .count();
+        assert_eq!(
+            alloc_nullable_count, 1,
+            "expected exactly 1 AllocNullableBool"
+        );
+
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 4: execute_mask_program with nullable AND chain — null rows should NOT pass.
+    #[test]
+    fn phase4_nullable_and_mask_program_nulls_filtered() -> VortexResult<()> {
+        //      a: T   F   N   T  — row 2 is NULL
+        //      b: T   T   T   T  (non-nullable)
+        // Expected mask: T F F T  (row 2: NULL AND T = NULL → does not pass filter)
+        let a = nullable_bool_array([true, false, false, true], [true, true, false, true]);
+        let b = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, true, true, true]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let scope = StructArray::from_fields(&[("a", a), ("b", b)])?.into_array();
+
+        let expr = and(col("a"), col("b"));
+        let input_mask = Mask::new_true(4);
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let expr_mask = scope.clone().apply(&expr)?.execute::<Mask>(&mut ctx_tree)?;
+        let baseline = input_mask.bitand(&expr_mask);
+
+        let program = compile(&expr, &scope)?;
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_mask_program(&program, &scope, &input_mask, &mut ctx_v2)?;
+        assert_eq!(actual, baseline, "nullable mask must filter out null rows");
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------------------------
+    // Phase 7 tests: constant folding and boolean identity elimination.
+    // ---------------------------------------------------------------------------------
+
+    /// Phase 7: all-constant scalar function is folded to a single `LoadConst` at compile time.
+    ///
+    /// `5 > 3` is always true and must compile to `LoadConst(true)` with no `Call` opcode.
+    #[test]
+    fn phase7_constant_fold_gt() -> VortexResult<()> {
+        let scope = StructArray::from_fields(&[("x", PrimitiveArray::from_iter([1_i32]).into_array())])?.into_array();
+        let expr = gt(lit(5_i32), lit(3_i32));
+        let program = compile(&expr, &scope)?;
+
+        assert!(
+            !program.opcodes.iter().any(|op| matches!(op, crate::lee::Opcode::Call { .. })),
+            "constant fold: expected no Call opcode, got: {:?}",
+            program.opcodes
+        );
+        let load_const_count = program
+            .opcodes
+            .iter()
+            .filter(|op| matches!(op, crate::lee::Opcode::LoadConst { .. }))
+            .count();
+        assert_eq!(load_const_count, 1, "expected exactly 1 LoadConst for folded constant");
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 7: `col("x") AND TRUE` identity-eliminates the TRUE leaf.
+    ///
+    /// The compiled program must not allocate a scratch buffer for the constant TRUE; it should
+    /// emit `AllocBool(true)` + `AndInto` for the non-constant leaf only.
+    #[test]
+    fn phase7_and_true_identity_eliminated() -> VortexResult<()> {
+        let col_x = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, false, true, true]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let scope = StructArray::from_fields(&[("x", col_x)])?.into_array();
+        let expr = and(col("x"), lit(true));
+        let program = compile(&expr, &scope)?;
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 7: `col("x") AND FALSE` short-circuits to a constant `FALSE` array.
+    #[test]
+    fn phase7_and_false_short_circuits() -> VortexResult<()> {
+        let col_x = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, false, true, true]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let scope = StructArray::from_fields(&[("x", col_x)])?.into_array();
+        let expr = and(col("x"), lit(false));
+        let program = compile(&expr, &scope)?;
+
+        // Must compile to a single LoadConst(false) + Return — no Call or AllocBool.
+        assert!(
+            !program.opcodes.iter().any(|op| matches!(op, crate::lee::Opcode::AllocBool { .. })),
+            "AND-FALSE short-circuit: expected no AllocBool, got: {:?}",
+            program.opcodes
+        );
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 7: `col("x") OR FALSE` identity-eliminates the FALSE leaf.
+    #[test]
+    fn phase7_or_false_identity_eliminated() -> VortexResult<()> {
+        let col_x = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, false, true, true]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let scope = StructArray::from_fields(&[("x", col_x)])?.into_array();
+        let expr = or(col("x"), lit(false));
+        let program = compile(&expr, &scope)?;
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
+        Ok(())
+    }
+
+    /// Phase 7: `col("x") OR TRUE` short-circuits to a constant `TRUE` array.
+    #[test]
+    fn phase7_or_true_short_circuits() -> VortexResult<()> {
+        let col_x = BoolArray::new(
+            vortex_buffer::BitBuffer::from_iter([true, false, true, true]),
+            crate::validity::Validity::NonNullable,
+        )
+        .into_array();
+        let scope = StructArray::from_fields(&[("x", col_x)])?.into_array();
+        let expr = or(col("x"), lit(true));
+        let program = compile(&expr, &scope)?;
+
+        assert!(
+            !program.opcodes.iter().any(|op| matches!(op, crate::lee::Opcode::AllocBool { .. })),
+            "OR-TRUE short-circuit: expected no AllocBool, got: {:?}",
+            program.opcodes
+        );
+
+        let mut ctx_tree = SESSION.create_execution_ctx();
+        let baseline = scope
+            .clone()
+            .apply(&expr)?
+            .execute::<crate::ArrayRef>(&mut ctx_tree)?;
+        let mut ctx_v2 = SESSION.create_execution_ctx();
+        let actual = execute_program(&program, &scope, &mut ctx_v2)?;
+        assert_arrays_eq!(actual, baseline);
         Ok(())
     }
 }

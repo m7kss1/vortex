@@ -3,38 +3,21 @@
 
 //! Opcode set for the linear expression engine.
 //!
-//! Phase 0 implemented the minimum needed to be equivalent to
-//! [`crate::ArrayRef::apply`] + `execute::<ArrayRef>`:
+//! Two families of bool opcodes operate in place on scratch registers, eliminating per-step
+//! `BoolArray` allocations:
 //!
-//! - [`Opcode::LoadScope`] — analogue of `Root`
-//! - [`Opcode::LoadConst`] — analogue of `Literal`
-//! - [`Opcode::Call`] — generic fallback; delegates to [`crate::scalar_fn::ScalarFnRef::execute`]
-//! - [`Opcode::Return`] — terminate program, yield the value in the given register
+//! - **Non-nullable** ([`OutputRegister::Bool`]): `AllocBool` / `AndInto` / `OrInto` / `NotInto`.
+//!   Compiler emits these when all bool operands are `DType::Bool(NonNullable)`.
+//! - **Kleene nullable** ([`OutputRegister::NullableBool`]): `AllocNullableBool` /
+//!   `AndIntoNullable` / `OrIntoNullable` / `NotIntoNullable`. Implements SQL three-valued logic
+//!   (NULL AND FALSE = FALSE; NULL OR TRUE = TRUE; NOT NULL = NULL) over paired values+validity
+//!   bit-buffers. Emitted when any bool operand is `DType::Bool(Nullable)`.
 //!
-//! Phase 1 adds **stateful** bool opcodes that operate in place on an
-//! [`super::OutputRegister::Bool`] scratch buffer, eliminating per-step `BoolArray`
-//! allocations for predicates of the form `e1 AND e2 (… AND eN)` and `NOT e`:
-//!
-//! - [`Opcode::AllocBool`] — initialise a destination Bool register with `init` bits (AND
-//!   wants `true`, OR wants `false`).
-//! - [`Opcode::AndInto`] — `regs[dst] &= regs[src].as_bool_bits()` word-by-word.
-//! - [`Opcode::OrInto`]  — `regs[dst] |= regs[src].as_bool_bits()` word-by-word.
-//! - [`Opcode::NotInto`] — flips bits in `regs[reg]` in place (XOR with 0xFF…).
-//!
-//! All Phase 1 stateful opcodes are *strictly non-nullable*: they look at values only and
-//! drop validity. The compiler only emits them when both operands have
-//! `DType::Bool(NonNullable)`; otherwise the generic `Call` path is used, preserving exact
-//! Kleene semantics of the legacy tree walker.
-//!
-//! Phase 3 adds [`Opcode::CaseMerge`] for LEE-style CASE WHEN evaluation. It implements
-//! a `zip`-style conditional write: `dst[i] = value[i] if cond[i] else dst[i]`. The compiler
-//! detects `CaseWhen` scalar functions and emits: compile ELSE → `dst`, then for each
-//! WHEN/THEN pair in **reverse** order emit `CaseMerge { dst, value: then_reg, cond: when_reg }`.
-//! Reverse order gives correct first-match-wins semantics: the first pair's write arrives last
-//! and wins over any later pair.
+//! `CaseMerge` implements `dst[i] = value[i] if cond[i] else dst[i]`. The compiler emits pairs
+//! in reverse WHEN order so that the first WHEN clause's write arrives last (first-match-wins).
 //!
 //! Each variant carries a discriminant exposed via [`Opcode::tag`]; the executor indexes its
-//! `HANDLERS` table by this tag (LEE-style threaded dispatch).
+//! `HANDLERS` table by this tag.
 
 use smallvec::SmallVec;
 
@@ -63,11 +46,31 @@ pub enum OpTag {
     /// dict values or codes sub-array produced by the encoding optimizer). Unlike [`LoadScope`]
     /// this bypasses the runtime scope argument; it holds the array object itself.
     LoadCapture = 9,
+
+    /// Phase 4: initialise `dst` as a nullable Bool scratch buffer. `values` is filled with
+    /// `init`; `validity` is all-true (every row starts as a known non-null value).
+    AllocNullableBool = 10,
+
+    /// Phase 4: Kleene AND-merge of `src` into `dst` (a NullableBool register).
+    ///
+    /// `dst_values &= src_values`. Validity follows three-valued logic:
+    /// `dst_valid = (dst_valid & src_valid) | (dst_valid & !dst_val) | (src_valid & !src_val)`.
+    AndIntoNullable = 11,
+
+    /// Phase 4: Kleene OR-merge of `src` into `dst` (a NullableBool register).
+    ///
+    /// `dst_values |= src_values`. Validity follows three-valued logic:
+    /// `dst_valid = (dst_valid & src_valid) | (dst_valid & dst_val) | (src_valid & src_val)`.
+    OrIntoNullable = 12,
+
+    /// Phase 4: flip the values bits of `reg` (a NullableBool register) in place.
+    /// Validity is unchanged: NOT NULL = NULL.
+    NotIntoNullable = 13,
 }
 
 impl OpTag {
     /// Number of distinct opcode tags. Used to size the executor's handler table.
-    pub const COUNT: usize = 10;
+    pub const COUNT: usize = 14;
 }
 
 /// A single opcode in an [`super::ExprProgram`].
@@ -130,6 +133,19 @@ pub enum Opcode {
     /// current scope and is valid for this batch only; programs containing this opcode are marked
     /// non-cacheable.
     LoadCapture { dst: RegId, array: ArrayRef },
+
+    /// Phase 4: initialise `dst` as a NullableBool scratch buffer with `values` = `init` and
+    /// `validity` = all-true.
+    AllocNullableBool { dst: RegId, init: bool },
+
+    /// Phase 4: Kleene AND-merge of `src` into `dst` (a NullableBool register).
+    AndIntoNullable { dst: RegId, src: RegId },
+
+    /// Phase 4: Kleene OR-merge of `src` into `dst` (a NullableBool register).
+    OrIntoNullable { dst: RegId, src: RegId },
+
+    /// Phase 4: flip the `values` bits of `reg` (a NullableBool register) in place.
+    NotIntoNullable { reg: RegId },
 }
 
 impl Opcode {
@@ -147,6 +163,10 @@ impl Opcode {
             Opcode::Return { .. } => OpTag::Return,
             Opcode::CaseMerge { .. } => OpTag::CaseMerge,
             Opcode::LoadCapture { .. } => OpTag::LoadCapture,
+            Opcode::AllocNullableBool { .. } => OpTag::AllocNullableBool,
+            Opcode::AndIntoNullable { .. } => OpTag::AndIntoNullable,
+            Opcode::OrIntoNullable { .. } => OpTag::OrIntoNullable,
+            Opcode::NotIntoNullable { .. } => OpTag::NotIntoNullable,
         }
     }
 }

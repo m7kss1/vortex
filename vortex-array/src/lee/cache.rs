@@ -83,10 +83,10 @@ impl ProgramCache {
         // Fast path: read-only cache probe. `DashMap::get` takes a shared lock on the shard and
         // does not insert, so cacheable programs already compiled by another thread are returned
         // immediately without taking the write lock.
-        if let Some(cell) = self.inner.get(&key) {
-            if let Some(program) = cell.get() {
-                return Ok(Arc::clone(program));
-            }
+        if let Some(cell) = self.inner.get(&key)
+            && let Some(program) = cell.get()
+        {
+            return Ok(Arc::clone(program));
         }
 
         // Cache miss (or non-cacheable): compile now.
@@ -114,19 +114,11 @@ impl ProgramCache {
 /// Extension trait for accessing [`ProgramCache`] from a [`VortexSession`].
 pub trait ProgramCacheSessionExt {
     /// Get or compile a program, using the session-scoped [`ProgramCache`].
-    fn compile_expr(
-        &self,
-        expr: &Expression,
-        scope: &ArrayRef,
-    ) -> VortexResult<Arc<ExprProgram>>;
+    fn compile_expr(&self, expr: &Expression, scope: &ArrayRef) -> VortexResult<Arc<ExprProgram>>;
 }
 
 impl ProgramCacheSessionExt for VortexSession {
-    fn compile_expr(
-        &self,
-        expr: &Expression,
-        scope: &ArrayRef,
-    ) -> VortexResult<Arc<ExprProgram>> {
+    fn compile_expr(&self, expr: &Expression, scope: &ArrayRef) -> VortexResult<Arc<ExprProgram>> {
         self.get::<ProgramCache>().get_or_compile(expr, scope)
     }
 }

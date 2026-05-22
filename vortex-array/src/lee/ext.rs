@@ -37,11 +37,7 @@ pub trait ArrayRefLeeExt {
     /// # Errors
     ///
     /// Returns an error if compilation or execution fails.
-    fn execute_expr_mask(
-        &self,
-        expr: &Expression,
-        session: &VortexSession,
-    ) -> VortexResult<Mask>;
+    fn execute_expr_mask(&self, expr: &Expression, session: &VortexSession) -> VortexResult<Mask>;
 
     /// Evaluate `expr` over `self`, intersecting the result with `input_mask`.
     ///
@@ -67,11 +63,7 @@ impl ArrayRefLeeExt for ArrayRef {
         execute_program(&program, self, &mut ctx)
     }
 
-    fn execute_expr_mask(
-        &self,
-        expr: &Expression,
-        session: &VortexSession,
-    ) -> VortexResult<Mask> {
+    fn execute_expr_mask(&self, expr: &Expression, session: &VortexSession) -> VortexResult<Mask> {
         let input_mask = Mask::new_true(self.len());
         self.execute_expr_mask_with_input(expr, &input_mask, session)
     }
@@ -87,4 +79,3 @@ impl ArrayRefLeeExt for ArrayRef {
         execute_mask_program(&program, self, input_mask, &mut ctx)
     }
 }
-

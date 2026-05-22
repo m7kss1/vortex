@@ -3,104 +3,79 @@
 
 //! Compile an [`Expression`] into a linear [`ExprProgram`].
 //!
-//! ## Overview
-//!
 //! Compilation runs in two stages:
 //!
-//! **Phase A + B — encoding-aware tree construction** (`scope.apply(expr)`):
+//! 1. **Encoding-aware tree construction** (`scope.apply(expr)`): builds a lazy
+//!    [`crate::arrays::ScalarFnArray`] tree with the scope bound at every `Root` node, then fires
+//!    encoding-specific optimizer rules at each node (dict push-down, struct field resolution, …).
 //!
-//! 1. [`crate::ArrayRef::apply`] walks the expression and builds a lazy [`crate::arrays::ScalarFnArray`]
-//!    tree in which each `Root` node is replaced by the live scope array and each `Literal` by a
-//!    [`crate::arrays::ConstantArray`].
-//! 2. At each tree node [`crate::optimizer::ArrayOptimizer::optimize`] fires the encoding-specific
-//!    `reduce` / `reduce_parent` rules registered on vtables (e.g.
-//!    `DictionaryScalarFnValuesPushDownRule`, `StructGetItemRule`, …). This resolves struct field
-//!    accesses to their concrete column arrays and, for dictionary-encoded columns, rewrites a
-//!    scalar function applied to the full column into a `take(fn(dict_values), codes)` pair — the
-//!    headline encoding-pushdown win.
+//! 2. **Lowering to opcodes** ([`lower_tree`]): walks the optimised tree and emits flat opcodes:
 //!
-//! **Phase C — lower to opcodes** ([`lower_tree`]):
-//!
-//! Walks the optimized `ArrayRef` tree and emits flat opcodes:
-//!
-//! | Tree node | Opcode(s) emitted |
+//! | Tree node | Opcodes emitted |
 //! |---|---|
-//! | The scope array itself (`Arc::ptr_eq`) | `LoadScope` (register shared) |
+//! | The scope array (`Arc::ptr_eq`) | `LoadScope` (register shared) |
 //! | [`crate::arrays::ConstantArray`] with `len == scope.len()` | `LoadConst` (cacheable) |
-//! | `ConstantArray` with `len != scope.len()` | `LoadCapture` (per-batch capture) |
+//! | `ConstantArray` with `len != scope.len()` | `LoadCapture` (per-batch) |
+//! | All-constant `ScalarFnArray` children | `LoadConst` (folded at compile time) |
 //! | Non-nullable bool `AND` chain | `AllocBool(true)` + N×`AndInto` |
 //! | Non-nullable bool `OR` chain | `AllocBool(false)` + N×`OrInto` |
 //! | Non-nullable bool `NOT` | `AllocBool(false)` + `OrInto` + `NotInto` |
+//! | Nullable bool `AND` chain | `AllocNullableBool(true)` + N×`AndIntoNullable` |
+//! | Nullable bool `OR` chain | `AllocNullableBool(false)` + N×`OrIntoNullable` |
+//! | Nullable bool `NOT` | `AllocNullableBool(false)` + `OrIntoNullable` + `NotIntoNullable` |
 //! | `CaseWhen` with ELSE | `lower(ELSE)` + reverse(`CaseMerge`) per pair |
 //! | `ScalarFnArray` (generic) | recurse children → `Call` |
-//! | Any other `ArrayRef` (sub-array extracted by optimizer) | `LoadCapture` |
+//! | Any other `ArrayRef` (optimizer-extracted sub-array) | `LoadCapture` |
 //!
 //! Programs that emit at least one `LoadCapture` set `cacheable = false` and are recompiled
-//! for each batch. Programs without captures (e.g. plain primitive columns) remain `cacheable =
-//! true` and are shared via [`super::ProgramCache`] across all batches of the same schema.
-//!
-//! ## Register allocation
-//!
-//! `CompileCtx::alloc_reg()` issues a new register id and `free_reg()` returns it to a free list
-//! so that ids are recycled across AND/OR leaves and CASE WHEN branches, keeping `num_regs` small.
-//! `scope_reg` (for `LoadScope`) and `capture_reg_map` (for `LoadCapture`) deduplicate repeated
-//! references to the same underlying array, avoiding redundant loads.
+//! per batch. Programs without captures remain `cacheable = true` and are shared via
+//! [`super::ProgramCache`] across all batches of the same schema.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use smallvec::SmallVec;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_utils::aliases::hash_map::HashMap;
 
 use super::ExprProgram;
 use super::Opcode;
 use super::RegId;
 use crate::ArrayRef;
+use crate::ExecutionCtx;
+use crate::IntoArray;
+use crate::array::ArrayView;
 use crate::arrays::Constant;
+use crate::arrays::ConstantArray;
 use crate::arrays::ScalarFn;
 use crate::arrays::scalar_fn::ScalarFnArrayExt;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::expr::Expression;
+use crate::scalar::Scalar;
+use crate::scalar_fn::ExecutionArgs;
 use crate::scalar_fn::fns::binary::Binary;
+use vortex_session::VortexSession;
 use crate::scalar_fn::fns::case_when::CaseWhen;
 use crate::scalar_fn::fns::not::Not;
 use crate::scalar_fn::fns::operators::Operator;
 
 /// Compile an expression into an executable [`ExprProgram`] for the given scope array.
 ///
-/// Internally this runs the full Phase A+B+C pipeline:
-/// 1. **Phase A** — calls [`crate::ArrayRef::apply`] to build a `ScalarFnArray` tree with the
-///    scope bound at every `Root` node.
-/// 2. **Phase B** — the encoding-aware `ArrayOptimizer` rules already fire inside `apply()` at
-///    each node, pushing scalar functions through dict / runend / struct encodings.
-/// 3. **Phase C** — [`lower_tree`] walks the optimised tree and emits a flat `Vec<Opcode>`.
+/// Runs the full encoding-aware pipeline: builds an optimised `ScalarFnArray` tree via
+/// `scope.apply(expr)` (which fires encoding-specific optimizer rules at each node), then lowers
+/// the tree to a flat opcode list.
 ///
-/// The returned program's [`ExprProgram::cacheable`] flag indicates whether it is safe to
-/// share across batches. Programs that contain [`Opcode::LoadCapture`] opcodes (i.e. those where
-/// the optimizer extracted sub-arrays from the scope) must be recompiled per batch.
-///
-/// # Arguments
-///
-/// * `expr` — the expression to compile
-/// * `scope` — the array this program will be executed against; its encoding structure drives
-///   the encoding-aware optimisation rules.
-///
-/// # Errors
-///
-/// Returns an error if `apply()` fails (e.g. type mismatch), if `optimize()` fails, or if the
-/// register count overflows `u16` (more than 65 535 live registers — practically unreachable).
+/// The returned program's [`ExprProgram::cacheable`] flag indicates whether it is safe to share
+/// across batches. Programs containing [`Opcode::LoadCapture`] opcodes must be recompiled per
+/// batch; all others are safe to share via [`super::ProgramCache`].
 pub fn compile(expr: &Expression, scope: &ArrayRef) -> VortexResult<ExprProgram> {
-    // Phase A + B: build the encoding-optimised ScalarFnArray tree.
     let tree = scope.clone().apply(expr)?;
 
-    // Phase C: lower the optimised tree to a flat opcode list.
     let scope_dtype = scope.dtype();
     let mut ctx = CompileCtx {
         opcodes: Vec::new(),
         next_reg: 0,
-        scope_dtype,
         scope: scope.clone(),
         scope_reg: None,
         free_list: SmallVec::new(),
@@ -118,29 +93,23 @@ pub fn compile(expr: &Expression, scope: &ArrayRef) -> VortexResult<ExprProgram>
     })
 }
 
-struct CompileCtx<'a> {
+struct CompileCtx {
     opcodes: Vec<Opcode>,
-    /// Next register id to allocate when the free list is empty.
     next_reg: u16,
-    scope_dtype: &'a DType,
-    /// The compile-time scope array, used for pointer-equality checks and capture dedup.
     scope: ArrayRef,
-    /// Shared register for the single `LoadScope` opcode. All occurrences of the scope array
-    /// in the tree reuse this register without emitting a second `LoadScope`.
+    /// Shared register for the single `LoadScope` opcode; reused by every occurrence of the
+    /// scope array in the tree without emitting a second `LoadScope`.
     scope_reg: Option<RegId>,
-    /// Dead registers available for reuse. `alloc_reg` pops from here before bumping `next_reg`,
-    /// so register ids are recycled across AND/OR leaf evaluations and CASE WHEN branches.
+    /// Dead registers available for reuse. Recycled across AND/OR leaf evaluations and CASE WHEN
+    /// branches to keep `num_regs` small.
     free_list: SmallVec<[RegId; 8]>,
-    /// Deduplication map for `LoadCapture` opcodes. Maps the array's pointer address to the
-    /// register already holding it, so the same sub-array (e.g. dict_values referenced by two
-    /// conjuncts) is loaded only once.
+    /// Maps pointer address → register for `LoadCapture` deduplication: the same sub-array
+    /// extracted by the optimizer (e.g. `dict_values`) is loaded only once.
     capture_map: HashMap<usize, RegId>,
-    /// Set to `true` the first time a `LoadCapture` opcode is emitted. Causes the resulting
-    /// `ExprProgram` to be marked non-cacheable.
     has_captures: bool,
 }
 
-impl CompileCtx<'_> {
+impl CompileCtx {
     /// Allocate the next available register, recycling dead registers first.
     fn alloc_reg(&mut self) -> VortexResult<RegId> {
         if let Some(id) = self.free_list.pop() {
@@ -156,8 +125,8 @@ impl CompileCtx<'_> {
 
     /// Mark a register as dead and eligible for reuse.
     ///
-    /// The scope register is never freed — it must remain valid throughout the program because
-    /// it is read by every `Call` opcode that accesses a scope column.
+    /// The scope register is never freed: it must remain valid for the lifetime of the program
+    /// because all `Call` opcodes that access scope columns read from it.
     fn free_reg(&mut self, id: RegId) {
         if Some(id) == self.scope_reg {
             return;
@@ -166,14 +135,25 @@ impl CompileCtx<'_> {
     }
 }
 
-/// True iff `array` has type `DType::Bool(NonNullable)`.
-fn is_non_nullable_bool_array(array: &ArrayRef) -> bool {
-    matches!(array.dtype(), DType::Bool(Nullability::NonNullable))
+fn is_bool_array(array: &ArrayRef) -> bool {
+    matches!(array.dtype(), DType::Bool(_))
+}
+
+fn is_nullable_bool_array(array: &ArrayRef) -> bool {
+    matches!(array.dtype(), DType::Bool(Nullability::Nullable))
+}
+
+/// Returns true if `array` is a `ConstantArray` with the same length as `scope`.
+///
+/// Such nodes can be constant-folded at compile time: the scalar value is scope-length-independent
+/// and the handler can broadcast it at runtime with a plain `LoadConst`.
+fn is_foldable_constant(array: &ArrayRef, scope_len: usize) -> bool {
+    array.as_opt::<Constant>().is_some() && array.len() == scope_len
 }
 
 /// Emit `LoadCapture` for `array` (or reuse an existing capture register), marking the program
 /// as non-cacheable.
-fn emit_capture(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId> {
+fn emit_capture(array: &ArrayRef, ctx: &mut CompileCtx) -> VortexResult<RegId> {
     let ptr = array.addr();
     if let Some(&existing) = ctx.capture_map.get(&ptr) {
         return Ok(existing);
@@ -188,16 +168,54 @@ fn emit_capture(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegI
     Ok(dst)
 }
 
-/// Recursively lower an optimised `ArrayRef` tree, emitting opcodes into `ctx` and returning
-/// the register that will hold the array's value at runtime.
+/// Attempt to constant-fold a `ScalarFnArray` node whose children are all scope-length constants.
 ///
-/// The tree was produced by [`crate::ArrayRef::apply`] + encoding-aware optimisation. Leaves
-/// are either the scope array itself, `ConstantArray` nodes (literals), `ScalarFnArray` nodes
-/// (unevaluated scalar functions), or raw sub-arrays extracted by the optimizer (e.g.
-/// `dict_values`, `dict_codes`).
-fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId> {
-    // ── 1. Scope identity: the scope array appears directly as a leaf when the expression is
-    //        `root()` or when a scalar function reduces to the scope unchanged.
+/// Executes the function with 1-row constant inputs, extracts the scalar result, and returns it.
+/// Using a 1-row execution is valid because every input row produces the same output when all
+/// inputs are constants.
+///
+/// Returns `None` if any child is not a foldable constant or if execution fails.
+fn try_constant_fold(sfn: ArrayView<'_, ScalarFn>, scope_len: usize) -> Option<Scalar> {
+    if sfn.nchildren() == 0 {
+        return None;
+    }
+    // All children must be scope-length ConstantArrays.
+    for i in 0..sfn.nchildren() {
+        if !is_foldable_constant(sfn.child_at(i), scope_len) {
+            return None;
+        }
+    }
+
+    // Execute with 1-row versions of each constant to produce a single-row result.
+    struct ConstArgs(SmallVec<[ArrayRef; 4]>);
+    impl ExecutionArgs for ConstArgs {
+        fn get(&self, index: usize) -> VortexResult<ArrayRef> {
+            self.0.get(index).cloned().ok_or_else(|| {
+                vortex_error::vortex_err!("index {} out of bounds", index)
+            })
+        }
+        fn num_inputs(&self) -> usize {
+            self.0.len()
+        }
+        fn row_count(&self) -> usize {
+            1
+        }
+    }
+
+    let mut inputs: SmallVec<[ArrayRef; 4]> = SmallVec::new();
+    for i in 0..sfn.nchildren() {
+        let c = sfn.child_at(i).as_opt::<Constant>()?;
+        inputs.push(ConstantArray::new(c.scalar().clone(), 1).into_array());
+    }
+
+    let mut ctx = ExecutionCtx::new(VortexSession::empty());
+    let result = sfn.scalar_fn().execute(&ConstArgs(inputs), &mut ctx).ok()?;
+
+    // Extract the scalar at row 0 from the 1-row result.
+    result.execute_scalar(0, &mut ctx).ok()
+}
+
+fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx) -> VortexResult<RegId> {
     if ArrayRef::ptr_eq(array, &ctx.scope.clone()) {
         if let Some(existing) = ctx.scope_reg {
             return Ok(existing);
@@ -208,10 +226,6 @@ fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId>
         return Ok(dst);
     }
 
-    // ── 2. ConstantArray: a literal scalar, possibly broadcast to an arbitrary length.
-    //        If it has the same length as the scope we can use `LoadConst` (the handler
-    //        re-creates the array at the scope's runtime length). Otherwise the length is
-    //        encoding-specific (e.g. dict n_values) and we must capture it as-is.
     if let Some(const_array) = array.as_opt::<Constant>() {
         let dst = ctx.alloc_reg()?;
         if array.len() == ctx.scope.len() {
@@ -221,7 +235,7 @@ fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId>
             });
         } else {
             // Length differs from scope (e.g. after dict-values pushdown). Capture the
-            // pre-sized array directly; `h_load_capture` will hand it to `Call` unchanged.
+            // pre-sized array directly.
             ctx.opcodes.push(Opcode::LoadCapture {
                 dst,
                 array: array.clone(),
@@ -232,61 +246,147 @@ fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId>
         return Ok(dst);
     }
 
-    // ── 3. ScalarFnArray: an unevaluated scalar function node with zero or more children.
-    //        Detect special patterns (AND/OR chains, NOT, CaseWhen) before the generic Call path.
     if let Some(sfn) = array.as_opt::<ScalarFn>() {
         let scalar_fn = sfn.scalar_fn().clone();
 
-        // AND chain over non-nullable bools → AllocBool(true) + N×AndInto.
+        // AND chain: collect bool leaves, filter out identity constants (TRUE), short-circuit on
+        // absorber (FALSE). Mixed nullable/non-nullable → Kleene path; all non-nullable → fast path.
         if matches!(scalar_fn.as_opt::<Binary>(), Some(Operator::And)) {
             let mut leaves: SmallVec<[ArrayRef; 8]> = SmallVec::new();
-            collect_and_leaves_tree(array, &mut leaves);
+            collect_bool_and_leaves_tree(array, &mut leaves);
             if !leaves.is_empty() {
+                // Short-circuit: any constant FALSE absorbs the whole AND.
+                if leaves.iter().any(|l| {
+                    l.as_opt::<Constant>()
+                        .and_then(|c| c.scalar().as_bool_opt().and_then(|b| b.value()))
+                        .is_some_and(|v| !v)
+                }) {
+                    let dst = ctx.alloc_reg()?;
+                    ctx.opcodes.push(Opcode::LoadConst {
+                        dst,
+                        scalar: Scalar::from(false),
+                    });
+                    return Ok(dst);
+                }
+                // Identity: drop constant TRUE leaves.
+                leaves.retain(|l| {
+                    !l.as_opt::<Constant>()
+                        .and_then(|c| c.scalar().as_bool_opt().and_then(|b| b.value()))
+                        .is_some_and(|v| v)
+                });
+                // If all leaves were identity-eliminated, the result is TRUE.
+                if leaves.is_empty() {
+                    let dst = ctx.alloc_reg()?;
+                    ctx.opcodes.push(Opcode::LoadConst {
+                        dst,
+                        scalar: Scalar::from(true),
+                    });
+                    return Ok(dst);
+                }
+                let any_nullable = leaves.iter().any(is_nullable_bool_array);
                 let dst = ctx.alloc_reg()?;
-                ctx.opcodes.push(Opcode::AllocBool { dst, init: true });
-                for leaf in &leaves {
-                    let leaf_reg = lower_tree(leaf, ctx)?;
-                    ctx.opcodes.push(Opcode::AndInto { dst, src: leaf_reg });
-                    ctx.free_reg(leaf_reg);
+                if any_nullable {
+                    ctx.opcodes
+                        .push(Opcode::AllocNullableBool { dst, init: true });
+                    for leaf in &leaves {
+                        let leaf_reg = lower_tree(leaf, ctx)?;
+                        ctx.opcodes
+                            .push(Opcode::AndIntoNullable { dst, src: leaf_reg });
+                        ctx.free_reg(leaf_reg);
+                    }
+                } else {
+                    ctx.opcodes.push(Opcode::AllocBool { dst, init: true });
+                    for leaf in &leaves {
+                        let leaf_reg = lower_tree(leaf, ctx)?;
+                        ctx.opcodes.push(Opcode::AndInto { dst, src: leaf_reg });
+                        ctx.free_reg(leaf_reg);
+                    }
                 }
                 return Ok(dst);
             }
         }
 
-        // OR chain over non-nullable bools → AllocBool(false) + N×OrInto.
+        // OR chain: filter out identity constants (FALSE), short-circuit on absorber (TRUE).
         if matches!(scalar_fn.as_opt::<Binary>(), Some(Operator::Or)) {
             let mut leaves: SmallVec<[ArrayRef; 8]> = SmallVec::new();
-            collect_or_leaves_tree(array, &mut leaves);
+            collect_bool_or_leaves_tree(array, &mut leaves);
             if !leaves.is_empty() {
+                // Short-circuit: any constant TRUE absorbs the whole OR.
+                if leaves.iter().any(|l| {
+                    l.as_opt::<Constant>()
+                        .and_then(|c| c.scalar().as_bool_opt().and_then(|b| b.value()))
+                        .is_some_and(|v| v)
+                }) {
+                    let dst = ctx.alloc_reg()?;
+                    ctx.opcodes.push(Opcode::LoadConst {
+                        dst,
+                        scalar: Scalar::from(true),
+                    });
+                    return Ok(dst);
+                }
+                // Identity: drop constant FALSE leaves.
+                leaves.retain(|l| {
+                    l.as_opt::<Constant>()
+                        .and_then(|c| c.scalar().as_bool_opt().and_then(|b| b.value()))
+                        .is_none_or(|v| v)
+                });
+                if leaves.is_empty() {
+                    let dst = ctx.alloc_reg()?;
+                    ctx.opcodes.push(Opcode::LoadConst {
+                        dst,
+                        scalar: Scalar::from(false),
+                    });
+                    return Ok(dst);
+                }
+                let any_nullable = leaves.iter().any(is_nullable_bool_array);
                 let dst = ctx.alloc_reg()?;
-                ctx.opcodes.push(Opcode::AllocBool { dst, init: false });
-                for leaf in &leaves {
-                    let leaf_reg = lower_tree(leaf, ctx)?;
-                    ctx.opcodes.push(Opcode::OrInto { dst, src: leaf_reg });
-                    ctx.free_reg(leaf_reg);
+                if any_nullable {
+                    ctx.opcodes
+                        .push(Opcode::AllocNullableBool { dst, init: false });
+                    for leaf in &leaves {
+                        let leaf_reg = lower_tree(leaf, ctx)?;
+                        ctx.opcodes
+                            .push(Opcode::OrIntoNullable { dst, src: leaf_reg });
+                        ctx.free_reg(leaf_reg);
+                    }
+                } else {
+                    ctx.opcodes.push(Opcode::AllocBool { dst, init: false });
+                    for leaf in &leaves {
+                        let leaf_reg = lower_tree(leaf, ctx)?;
+                        ctx.opcodes.push(Opcode::OrInto { dst, src: leaf_reg });
+                        ctx.free_reg(leaf_reg);
+                    }
                 }
                 return Ok(dst);
             }
         }
 
-        // NOT over a non-nullable bool child.
-        if scalar_fn.is::<Not>()
-            && sfn.nchildren() == 1
-            && is_non_nullable_bool_array(sfn.child_at(0))
-        {
-            let child_reg = lower_tree(sfn.child_at(0), ctx)?;
+        if scalar_fn.is::<Not>() && sfn.nchildren() == 1 && is_bool_array(sfn.child_at(0)) {
+            let child = sfn.child_at(0);
+            let nullable = is_nullable_bool_array(child);
+            let child_reg = lower_tree(child, ctx)?;
             let dst = ctx.alloc_reg()?;
-            ctx.opcodes.push(Opcode::AllocBool { dst, init: false });
-            ctx.opcodes.push(Opcode::OrInto {
-                dst,
-                src: child_reg,
-            });
-            ctx.free_reg(child_reg);
-            ctx.opcodes.push(Opcode::NotInto { reg: dst });
+            if nullable {
+                ctx.opcodes
+                    .push(Opcode::AllocNullableBool { dst, init: false });
+                ctx.opcodes.push(Opcode::OrIntoNullable {
+                    dst,
+                    src: child_reg,
+                });
+                ctx.free_reg(child_reg);
+                ctx.opcodes.push(Opcode::NotIntoNullable { reg: dst });
+            } else {
+                ctx.opcodes.push(Opcode::AllocBool { dst, init: false });
+                ctx.opcodes.push(Opcode::OrInto {
+                    dst,
+                    src: child_reg,
+                });
+                ctx.free_reg(child_reg);
+                ctx.opcodes.push(Opcode::NotInto { reg: dst });
+            }
             return Ok(dst);
         }
 
-        // CaseWhen with an explicit ELSE clause → CaseMerge opcodes (reverse pair order).
         if let Some(opts) = scalar_fn.as_opt::<CaseWhen>() {
             let num_pairs = opts.num_when_then_pairs as usize;
             let has_else = opts.has_else;
@@ -298,7 +398,7 @@ fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId>
                 let d = ctx.alloc_reg()?;
                 ctx.opcodes.push(Opcode::LoadConst {
                     dst: d,
-                    scalar: crate::scalar::Scalar::null(result_dtype),
+                    scalar: Scalar::null(result_dtype),
                 });
                 d
             };
@@ -317,7 +417,14 @@ fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId>
             return Ok(dst);
         }
 
-        // Generic ScalarFnArray: lower children left-to-right, emit a Call opcode.
+        // Constant folding: if all children are scope-length constants, execute now and emit
+        // LoadConst. This handles expressions like `5 > 3`, `NOT FALSE`, etc.
+        if let Some(scalar) = try_constant_fold(sfn, ctx.scope.len()) {
+            let dst = ctx.alloc_reg()?;
+            ctx.opcodes.push(Opcode::LoadConst { dst, scalar });
+            return Ok(dst);
+        }
+
         let mut arg_regs: SmallVec<[RegId; 4]> = SmallVec::new();
         for i in 0..sfn.nchildren() {
             arg_regs.push(lower_tree(sfn.child_at(i), ctx)?);
@@ -331,47 +438,39 @@ fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx<'_>) -> VortexResult<RegId>
         return Ok(dst);
     }
 
-    // ── 4. Any other array: a sub-array extracted from the scope by the encoding optimizer
-    //        (e.g. `dict_values`, `dict_codes`, or a fully-evaluated sub-expression). Capture
-    //        it by pointer, deduplicating if the same array appears in multiple conjuncts.
     emit_capture(array, ctx)
 }
 
-/// Flatten a non-nullable-bool AND tree into a flat list of leaf arrays.
-///
-/// Only descends into `ScalarFnArray(Binary(And))` nodes whose children are both non-nullable
-/// bool. Any mixed-nullability subtree is treated as an opaque leaf.
-fn collect_and_leaves_tree(array: &ArrayRef, out: &mut SmallVec<[ArrayRef; 8]>) {
-    if let Some(sfn) = array.as_opt::<ScalarFn>() {
-        if matches!(sfn.scalar_fn().as_opt::<Binary>(), Some(Operator::And))
-            && sfn.nchildren() == 2
-            && is_non_nullable_bool_array(sfn.child_at(0))
-            && is_non_nullable_bool_array(sfn.child_at(1))
-        {
-            collect_and_leaves_tree(sfn.child_at(0), out);
-            collect_and_leaves_tree(sfn.child_at(1), out);
-            return;
-        }
+/// Flatten a bool AND tree into leaf arrays, stopping at non-AND or non-bool nodes.
+fn collect_bool_and_leaves_tree(array: &ArrayRef, out: &mut SmallVec<[ArrayRef; 8]>) {
+    if let Some(sfn) = array.as_opt::<ScalarFn>()
+        && matches!(sfn.scalar_fn().as_opt::<Binary>(), Some(Operator::And))
+        && sfn.nchildren() == 2
+        && is_bool_array(sfn.child_at(0))
+        && is_bool_array(sfn.child_at(1))
+    {
+        collect_bool_and_leaves_tree(sfn.child_at(0), out);
+        collect_bool_and_leaves_tree(sfn.child_at(1), out);
+        return;
     }
-    if is_non_nullable_bool_array(array) {
+    if is_bool_array(array) {
         out.push(array.clone());
     }
 }
 
-/// Flatten a non-nullable-bool OR tree into a flat list of leaf arrays.
-fn collect_or_leaves_tree(array: &ArrayRef, out: &mut SmallVec<[ArrayRef; 8]>) {
-    if let Some(sfn) = array.as_opt::<ScalarFn>() {
-        if matches!(sfn.scalar_fn().as_opt::<Binary>(), Some(Operator::Or))
-            && sfn.nchildren() == 2
-            && is_non_nullable_bool_array(sfn.child_at(0))
-            && is_non_nullable_bool_array(sfn.child_at(1))
-        {
-            collect_or_leaves_tree(sfn.child_at(0), out);
-            collect_or_leaves_tree(sfn.child_at(1), out);
-            return;
-        }
+/// Flatten a bool OR tree into leaf arrays, stopping at non-OR or non-bool nodes.
+fn collect_bool_or_leaves_tree(array: &ArrayRef, out: &mut SmallVec<[ArrayRef; 8]>) {
+    if let Some(sfn) = array.as_opt::<ScalarFn>()
+        && matches!(sfn.scalar_fn().as_opt::<Binary>(), Some(Operator::Or))
+        && sfn.nchildren() == 2
+        && is_bool_array(sfn.child_at(0))
+        && is_bool_array(sfn.child_at(1))
+    {
+        collect_bool_or_leaves_tree(sfn.child_at(0), out);
+        collect_bool_or_leaves_tree(sfn.child_at(1), out);
+        return;
     }
-    if is_non_nullable_bool_array(array) {
+    if is_bool_array(array) {
         out.push(array.clone());
     }
 }
