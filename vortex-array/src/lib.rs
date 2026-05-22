@@ -46,6 +46,7 @@ pub mod display;
 pub mod dtype;
 mod executor;
 pub mod expr;
+pub mod lee;
 mod expression;
 pub mod extension;
 mod hash;

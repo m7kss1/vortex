@@ -149,6 +149,23 @@ impl ScalarFnRef {
         self.0.execute(args, ctx)
     }
 
+    /// Execute the expression and write the result into `dst`.
+    ///
+    /// The default implementation calls [`Self::execute`] and stores the result as a
+    /// [`crate::lee::OutputRegister::View`]. Callers may supply an already-initialised
+    /// destination register; specialised implementations can write into it directly instead of
+    /// allocating a new array.
+    pub fn execute_into(
+        &self,
+        args: &dyn ExecutionArgs,
+        dst: &mut crate::lee::OutputRegister,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        let result = self.0.execute(args, ctx)?;
+        dst.assign_view(result);
+        Ok(())
+    }
+
     /// Perform abstract reduction on this scalar function node.
     pub fn reduce(
         &self,

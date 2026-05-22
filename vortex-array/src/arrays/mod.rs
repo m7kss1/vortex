@@ -75,7 +75,9 @@ pub use primitive::Primitive;
 pub use primitive::PrimitiveArray;
 
 pub mod scalar_fn;
+#[doc(hidden)]
 pub use scalar_fn::ScalarFn;
+#[doc(hidden)]
 pub use scalar_fn::ScalarFnArray;
 
 pub mod shared;

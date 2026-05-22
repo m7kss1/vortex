@@ -9,8 +9,8 @@ use futures::try_join;
 use itertools::Itertools;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
-use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::StructArray;
+use vortex_array::lee::ArrayRefLeeExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::expr::Expression;
@@ -18,7 +18,6 @@ use vortex_array::expr::transform::PartitionedExpr;
 use vortex_array::validity::Validity;
 use vortex_error::VortexError;
 use vortex_error::VortexResult;
-use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
 use crate::ArrayFuture;
@@ -35,6 +34,7 @@ pub trait PartitionedExprEval<P> {
     fn into_array_future(
         self: Arc<Self>,
         mask: MaskFuture,
+        session: VortexSession,
         array_fn: impl Fn(&P, &Expression, MaskFuture) -> VortexResult<ArrayFuture>,
     ) -> VortexResult<ArrayFuture>;
 }
@@ -89,8 +89,7 @@ impl<P: Send + Sync + 'static> PartitionedExprEval<P> for PartitionedExpr<P> {
             )?
             .into_array();
 
-            let mut ctx = session.create_execution_ctx();
-            let root_mask = root_scope.apply(&self.root)?.execute::<Mask>(&mut ctx)?;
+            let root_mask = root_scope.execute_expr_mask(&self.root, &session)?;
 
             let mask = mask.bitand(&root_mask);
 
@@ -101,6 +100,7 @@ impl<P: Send + Sync + 'static> PartitionedExprEval<P> for PartitionedExpr<P> {
     fn into_array_future(
         self: Arc<Self>,
         mask: MaskFuture,
+        session: VortexSession,
         array_fn: impl Fn(&P, &Expression, MaskFuture) -> VortexResult<ArrayFuture>,
     ) -> VortexResult<ArrayFuture> {
         // Construct evaluations for each child.
@@ -124,7 +124,7 @@ impl<P: Send + Sync + 'static> PartitionedExprEval<P> for PartitionedExpr<P> {
             )?
             .into_array();
 
-            root_scope.apply(&self.root)
+            root_scope.execute_expr(&self.root, &session)
         }))
     }
 }

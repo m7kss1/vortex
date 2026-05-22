@@ -21,6 +21,7 @@ use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::expr::Expression;
 use vortex_array::expr::root;
+use vortex_array::lee::ArrayRefLeeExt;
 use vortex_array::optimizer::ArrayOptimizer;
 use vortex_error::VortexError;
 use vortex_error::VortexExpect;
@@ -135,12 +136,13 @@ impl DictReader {
             return fut.clone();
         }
 
+        let session = self.session.clone();
         self.values_evals
             .entry(expr.clone())
             .or_insert_with(|| {
                 self.values_array_uncanonical()
                     .map(move |array| {
-                        let array = array?.apply(&expr)?;
+                        let array = array?.execute_expr(&expr, &session)?;
                         Ok(SharedArray::new(array).into_array())
                     })
                     .boxed()
@@ -232,6 +234,7 @@ impl LayoutReader for DictReader {
         let expr = expr.clone();
 
         let all_values_referenced = self.layout.has_all_values_referenced();
+        let session = self.session.clone();
         Ok(async move {
             let (values, codes) = try_join!(values_eval.map_err(VortexError::from), codes_eval)?;
 
@@ -247,7 +250,7 @@ impl LayoutReader for DictReader {
             .into_array()
             .optimize()?;
 
-            array.apply(&expr)
+            array.execute_expr(&expr, &session)
         }
         .boxed())
     }

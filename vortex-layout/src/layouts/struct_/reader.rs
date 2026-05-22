@@ -337,15 +337,19 @@ impl LayoutReader for StructReader {
             ),
 
             Partitioned::Multi(partitioned) => (
-                Arc::clone(partitioned).into_array_future(mask_fut, |name, expr, mask| {
-                    self.field_reader(name)?
-                        .projection_evaluation(row_range, expr, mask)
-                        .map_err(|err| {
-                            err.with_context(format!(
-                                "While evaluating projection partition {name}"
-                            ))
-                        })
-                })?,
+                Arc::clone(partitioned).into_array_future(
+                    mask_fut,
+                    self.session.clone(),
+                    |name, expr, mask| {
+                        self.field_reader(name)?
+                            .projection_evaluation(row_range, expr, mask)
+                            .map_err(|err| {
+                                err.with_context(format!(
+                                    "While evaluating projection partition {name}"
+                                ))
+                            })
+                    },
+                )?,
                 partitioned.root.is::<Pack>() || partitioned.root.is::<Merge>(),
             ),
         };

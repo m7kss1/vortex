@@ -2,7 +2,6 @@
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 use std::collections::BTreeSet;
-use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -14,6 +13,9 @@ use vortex_array::VortexSessionExecute;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::expr::Expression;
+use vortex_array::lee::ArrayRefLeeExt;
+use vortex_array::lee::ProgramCacheSessionExt;
+use vortex_array::lee::execute_mask_program;
 use vortex_array::serde::SerializedArray;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -149,19 +151,18 @@ impl LayoutReader for FlatReader {
                 // We have the choice to apply the filter or the expression first, we apply the
                 // expression first so that it can try pushing down itself and then the filter
                 // after this.
-                let array = array.apply(&expr)?;
-                let array = array.filter(mask.clone())?;
+                let bool_array = array.execute_expr(&expr, &session)?;
+                let filtered = bool_array.filter(mask.clone())?;
                 let mut ctx = session.create_execution_ctx();
-                let array_mask = array.execute::<Mask>(&mut ctx)?;
+                let array_mask = filtered.execute::<Mask>(&mut ctx)?;
 
                 mask.intersect_by_rank(&array_mask)
             } else {
-                // Run over the full array, with a simpler bitand at the end.
-                let array = array.apply(&expr)?;
+                // Run over the full array using the linear engine: compile the expression once
+                // per session, then execute it without intermediate allocations.
                 let mut ctx = session.create_execution_ctx();
-                let array_mask = array.execute::<Mask>(&mut ctx)?;
-
-                mask.bitand(&array_mask)
+                let program = session.compile_expr(&expr, &array)?;
+                execute_mask_program(&program, &array, &mask, &mut ctx)?
             };
 
             tracing::debug!(
@@ -189,6 +190,7 @@ impl LayoutReader for FlatReader {
         let name = Arc::clone(&self.name);
         let array = self.array_future();
         let expr = expr.clone();
+        let session = self.session.clone();
 
         Ok(async move {
             tracing::debug!("Flat array evaluation {} - {}", name, expr);
@@ -210,7 +212,7 @@ impl LayoutReader for FlatReader {
             }
 
             // Evaluate the projection expression.
-            array = array.apply(&expr)?;
+            array = array.execute_expr(&expr, &session)?;
 
             Ok(array)
         }

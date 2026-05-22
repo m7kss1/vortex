@@ -14,7 +14,21 @@ use crate::scalar_fn::fns::literal::Literal;
 use crate::scalar_fn::fns::root::Root;
 
 impl ArrayRef {
-    /// Apply the expression to this array, producing a new array in constant time.
+    /// Apply the expression to this array, producing a new lazy [`ScalarFnArray`] tree.
+    ///
+    /// # Prefer [`ArrayRefLeeExt::execute_expr`]
+    ///
+    /// This method returns a lazily-evaluated array tree. Callers that simply want to evaluate
+    /// an expression should use the session-aware LEE entry points instead:
+    ///
+    /// ```rust,ignore
+    /// use vortex_array::lee::ArrayRefLeeExt as _;
+    /// let result = array.execute_expr(&expr, &session)?;
+    /// ```
+    ///
+    /// `apply` is kept for internal code paths that need to inspect the array tree before
+    /// evaluation (e.g. `substitute_row_count` for zone-map pruning).
+    #[doc(hidden)]
     pub fn apply(self, expr: &Expression) -> VortexResult<ArrayRef> {
         // If the expression is a root, return self.
         if expr.is::<Root>() {

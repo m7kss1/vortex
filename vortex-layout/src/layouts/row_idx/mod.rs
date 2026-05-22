@@ -20,6 +20,7 @@ use vortex_array::Canonical;
 use vortex_array::IntoArray;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
+use vortex_array::lee::ArrayRefLeeExt;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
 use vortex_array::dtype::FieldName;
@@ -249,16 +250,20 @@ impl LayoutReader for RowIdxLayoutReader {
             )),
             Partitioning::Child(expr) => self.child.projection_evaluation(row_range, expr, mask),
             Partitioning::Partitioned(p) => {
-                Arc::clone(p).into_array_future(mask, |annotation, expr, mask| match annotation {
-                    Partition::RowIdx => Ok(row_idx_array_future(
-                        self.row_offset,
-                        row_range,
-                        expr,
-                        mask,
-                        self.session.clone(),
-                    )),
-                    Partition::Child => self.child.projection_evaluation(row_range, expr, mask),
-                })
+                Arc::clone(p).into_array_future(
+                    mask,
+                    self.session.clone(),
+                    |annotation, expr, mask| match annotation {
+                        Partition::RowIdx => Ok(row_idx_array_future(
+                            self.row_offset,
+                            row_range,
+                            expr,
+                            mask,
+                            self.session.clone(),
+                        )),
+                        Partition::Child => self.child.projection_evaluation(row_range, expr, mask),
+                    },
+                )
             }
         }
     }
@@ -293,8 +298,7 @@ fn row_idx_mask_future(
     MaskFuture::new(mask.len(), async move {
         let array = idx_array(row_offset, &row_range).into_array();
 
-        let mut ctx = session.create_execution_ctx();
-        let result_mask = array.apply(&expr)?.execute::<Mask>(&mut ctx)?;
+        let result_mask = array.execute_expr_mask(&expr, &session)?;
 
         Ok(result_mask.bitand(&mask.await?))
     })
@@ -314,7 +318,7 @@ fn row_idx_array_future(
         let filtered = array.filter(mask.await?)?;
         let mut ctx = session.create_execution_ctx();
         let array = filtered.execute::<Canonical>(&mut ctx)?.into_array();
-        array.apply(&expr)
+        array.execute_expr(&expr, &session)
     }
     .boxed()
 }
