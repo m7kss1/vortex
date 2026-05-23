@@ -13,6 +13,8 @@ use std::fmt::Debug;
 use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use vortex_error::VortexResult;
 use vortex_session::SessionExt;
@@ -28,6 +30,17 @@ use crate::expr::Expression;
 use crate::lee::ExprProgram;
 use crate::lee::compile;
 
+/// Hit/miss statistics from a [`ProgramCache`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CacheStats {
+    /// Number of times a compiled program was found in the cache.
+    pub hits: u64,
+    /// Number of times a program was compiled from scratch (cache miss or non-cacheable).
+    pub misses: u64,
+    /// Number of distinct entries currently stored in the cache.
+    pub entries: usize,
+}
+
 /// Session-scoped cache for compiled [`ExprProgram`]s.
 ///
 /// Add to a session with `session.with::<ProgramCache>()`. Programs are compiled once
@@ -37,9 +50,20 @@ use crate::lee::compile;
 ///
 /// `ProgramCache` is `Send + Sync`: the inner [`DashMap`] is concurrency-safe and the
 /// [`OnceLock`] per entry ensures compile happens exactly once even under contention.
-#[derive(Default)]
 pub struct ProgramCache {
     inner: DashMap<CacheKey, Arc<OnceLock<Arc<ExprProgram>>>>,
+    hits: AtomicU64,
+    misses: AtomicU64,
+}
+
+impl Default for ProgramCache {
+    fn default() -> Self {
+        Self {
+            inner: DashMap::default(),
+            hits: AtomicU64::new(0),
+            misses: AtomicU64::new(0),
+        }
+    }
 }
 
 impl Debug for ProgramCache {
@@ -86,10 +110,12 @@ impl ProgramCache {
         if let Some(cell) = self.inner.get(&key)
             && let Some(program) = cell.get()
         {
+            self.hits.fetch_add(1, Ordering::Relaxed);
             return Ok(Arc::clone(program));
         }
 
         // Cache miss (or non-cacheable): compile now.
+        self.misses.fetch_add(1, Ordering::Relaxed);
         let compiled = Arc::new(compile(expr, scope)?);
 
         // Programs containing `LoadCapture` opcodes embed batch-specific arrays extracted by the
@@ -108,6 +134,15 @@ impl ProgramCache {
             .clone();
         drop(cell.set(Arc::clone(&compiled)));
         Ok(cell.get().cloned().unwrap_or(compiled))
+    }
+
+    /// Return a snapshot of cache hit/miss counters and current entry count.
+    pub fn stats(&self) -> CacheStats {
+        CacheStats {
+            hits: self.hits.load(Ordering::Relaxed),
+            misses: self.misses.load(Ordering::Relaxed),
+            entries: self.inner.len(),
+        }
     }
 }
 

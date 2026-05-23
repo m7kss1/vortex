@@ -143,6 +143,8 @@ fn is_nullable_bool_array(array: &ArrayRef) -> bool {
     matches!(array.dtype(), DType::Bool(Nullability::Nullable))
 }
 
+
+
 /// Returns true if `array` is a `ConstantArray` with the same length as `scope`.
 ///
 /// Such nodes can be constant-folded at compile time: the scalar value is scope-length-independent
@@ -216,7 +218,7 @@ fn try_constant_fold(sfn: ArrayView<'_, ScalarFn>, scope_len: usize) -> Option<S
 }
 
 fn lower_tree(array: &ArrayRef, ctx: &mut CompileCtx) -> VortexResult<RegId> {
-    if ArrayRef::ptr_eq(array, &ctx.scope.clone()) {
+    if ArrayRef::ptr_eq(array, &ctx.scope) {
         if let Some(existing) = ctx.scope_reg {
             return Ok(existing);
         }

@@ -318,6 +318,154 @@ migrated once row-count substitution is moved to the `Expression` level.
 
 ---
 
+## Cache hot path:
+
+The `ProgramCache` lookup runs on every batch — 30 000 batches for TPC-H SF5 lineitem.
+Getting it wrong shows up as a large fraction of total filter CPU. This section documents
+two regressions found and fixed by profiling, both in the O(1) path that was supposed to
+be cheap.
+
+---
+
+### Fix 1 — `Id::new` on every cache probe (DashMap in the hot path)
+
+**Symptom.** Diff flamegraph (LEE minus Legacy) highlighted `dashmap::*` consuming ~80 % of LEE
+filter CPU — none of it was in Legacy:
+
+```
++17.62%  dashmap::hash_u64
++16.85%  dashmap::DashMap::_get
+ +5.62%  vortex_session::registry::Id::new
+```
+
+**Root cause.** Every scalar function's `id()` method was:
+
+```rust
+fn id(&self) -> ScalarFnId {
+    ScalarFnId::new("vortex.binary")   // hits the global string interner on every call
+}
+```
+
+`ScalarFnId` is a type alias for `vortex_session::registry::Id`, whose `::new` calls
+`INTERNER.get_or_intern(s)` on a `LazyLock<ThreadedRodeo>` backed by a `DashMap`:
+
+```
+ProgramCache::get_or_compile
+  → ExactExpr::hash
+    → ScalarFnRef::hash
+      → <dyn DynScalarFn>::id()
+        → Id::new("vortex.binary")
+          → ThreadedRodeo::get_or_intern
+            → DashMap::_get         shard lock + hash probe, every call
+```
+
+`Expression` derives `Hash`, which calls `ScalarFnRef::hash` at each tree node, which calls
+`id()`. For Q6's 7-node expression that's 7 interner lookups per cache probe — times 30 000
+batches, times every row-group's hash traversal. Collapsed stacks showed 31 occurrences of
+`Id::new` and 60+ occurrences of `dashmap::*` per sample window.
+
+**Fix.** Use the `CachedId` pattern already in use for array vtables. `CachedId` wraps a
+`OnceLock<Id>` — first deref interns, all subsequent calls are a single atomic load:
+
+```rust
+fn id(&self) -> ScalarFnId {
+    static ID: CachedId = CachedId::new("vortex.binary");
+    *ID
+}
+```
+
+Applied to 21 sites across `vortex-array`, `vortex-layout`, and `vortex-tensor`. In addition,
+`ScalarFnRef::eq` gained an `Arc::ptr_eq` fast-path so the common case (same `Arc` instance)
+skips `id()` and `options_eq` entirely:
+
+```rust
+impl PartialEq for ScalarFnRef {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+            || (self.0.id() == other.0.id() && self.0.options_eq(other.0.options_any()))
+    }
+}
+```
+
+**Result.** LEE: 39 425 ms → 6 144 ms (6.4×). Collapsed-stack occurrences:
+`Id::new` 31 → 3, `dashmap::*` 60+ → 14. LEE reached parity with Legacy.
+
+---
+
+### Fix 2 — `ExactExpr::hash` walking the full expression tree
+
+**Symptom.** Still showed `ProgramCache::get_or_compile`
+at ~22 % of LEE CPU with these leaf frames:
+
+```
+2 222 M  ProgramCache::get_or_compile
+1 343 M  TypedScalarFnInstance::options_eq
+  757 M  TypedScalarFnInstance::id
+  616 M  TypedScalarFnInstance::options_any
+  575 M  Any::type_id
+  454 M  CachedId::deref
+```
+
+**Root cause.** `ExactExpr::eq` compares only the root — root scalar function plus children
+`Arc` pointer:
+
+```rust
+impl PartialEq for ExactExpr {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.scalar_fn() == other.0.scalar_fn()
+            && Arc::ptr_eq(self.0.children(), other.0.children())
+    }
+}
+```
+
+But `ExactExpr::hash` was implemented via `Expression`'s derived `Hash`, which recurses into
+every child:
+
+```rust
+impl Hash for ExactExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.hash(state);   // Expression's derived Hash — full tree walk
+    }
+}
+```
+
+At every DashMap probe, `hash` did N × `id()` + N × `options_hash` while `eq` did one
+`Arc::ptr_eq`. `Hash` was doing N× the work of `Eq`, on a path that runs per batch.
+
+**Fix.** Make `Hash` mirror `Eq` exactly — hash only the root scalar function and the
+`Arc<Vec<Expression>>` pointer:
+
+```rust
+impl Hash for ExactExpr {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.0.scalar_fn().hash(state);
+        (Arc::as_ptr(self.0.children()) as usize).hash(state);
+    }
+}
+```
+
+Correctness: `a == b -> hash(a) == hash(b)` holds because the hash inputs are exactly the
+values `PartialEq` compares. `Arc::as_ptr` is a stable identity for the `Arc<Vec<Expression>>`
+that equality also keys on — a scan reusing the same parsed `Expression` across all batches
+produces the same pointer every time.
+
+**Result.** LEE: 6 144 ms -> `1 014 ms (additional 6×). Post-fix collapsed stacks show no
+`ProgramCache`, `options_eq`, `id`, `CachedId::deref` in the top frames — the profile is
+now dominated by pco decompression and the allocator:
+
+```
+464 M  [unknown]
+343 M  pco::PageLatentDecompressor::read_full_ans_symbols
+202 M  pco::read_offsets
+181 M  GenericShunt::next
+151 M  mi_free
+```
+
+Cache-probe overhead per batch is now constant: one `CachedId` hash, one pointer hash,
+one shard read-lock, one `Arc::ptr_eq`, one atomic load, one `Arc::clone`.
+
+---
+
 ## Future work
 
 ### 1. Cacheable programs for dict/struct columns

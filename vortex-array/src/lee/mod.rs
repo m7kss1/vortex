@@ -36,6 +36,7 @@ mod opcode;
 mod program;
 mod register;
 
+pub use cache::CacheStats;
 pub use cache::ProgramCache;
 pub use cache::ProgramCacheSessionExt;
 pub use compile::compile;

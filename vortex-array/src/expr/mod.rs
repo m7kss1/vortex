@@ -91,7 +91,10 @@ impl Eq for ExactExpr {}
 
 impl Hash for ExactExpr {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
+        // Mirror PartialEq exactly: root scalar_fn + children Arc identity.
+        // Avoids walking the full expression tree on every cache probe.
+        self.0.scalar_fn().hash(state);
+        (Arc::as_ptr(self.0.children()) as usize).hash(state);
     }
 }
 

@@ -237,7 +237,8 @@ impl Display for ScalarFnRef {
 
 impl PartialEq for ScalarFnRef {
     fn eq(&self, other: &Self) -> bool {
-        self.0.id() == other.0.id() && self.0.options_eq(other.0.options_any())
+        Arc::ptr_eq(&self.0, &other.0)
+            || (self.0.id() == other.0.id() && self.0.options_eq(other.0.options_any()))
     }
 }
 impl Eq for ScalarFnRef {}

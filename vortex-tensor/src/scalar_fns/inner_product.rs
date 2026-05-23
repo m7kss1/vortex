@@ -44,6 +44,7 @@ use vortex_buffer::BufferMut;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::matcher::AnyTensor;
 use crate::scalar_fns::l2_denorm::DenormOrientation;
@@ -92,7 +93,8 @@ impl ScalarFnVTable for InnerProduct {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.tensor.inner_product")
+        static ID: CachedId = CachedId::new("vortex.tensor.inner_product");
+        *ID
     }
 
     fn arity(&self, _options: &Self::Options) -> Arity {
