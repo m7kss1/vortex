@@ -4,6 +4,7 @@
 //! Deterministic-counter diff gate over two profile reports.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
@@ -24,6 +25,18 @@ pub const HARD_COUNTERS_UP: &[&str] = &[
     "decode.total_calls",
     "pushdown_fallback.total",
 ];
+
+/// Whether `key` is a dynamic per-encoding / per-pair counter gated as
+/// increase-bad. The fixed [`HARD_COUNTERS_UP`] totals (`decode.total_calls`,
+/// `pushdown_fallback.total`) can stay flat while work shifts between encodings,
+/// so we additionally gate every `decode.<encoding>.calls` and
+/// `pushdown_fallback.<parent>=><child>.count` present in both reports. This is
+/// what surfaces a pushdown regression that forces extra decodes of one
+/// encoding without changing the grand total.
+pub fn is_dynamic_hard_counter(key: &str) -> bool {
+    (key.starts_with("decode.") && key.ends_with(".calls") && key != "decode.total_calls")
+        || (key.starts_with("pushdown_fallback.") && key.ends_with(".count"))
+}
 
 /// Counters where a *decrease* beyond tolerance is a regression (less work
 /// skipped than before).
@@ -84,7 +97,11 @@ pub fn diff(
     tolerance: f64,
 ) -> DiffOutcome {
     let mut rows = Vec::new();
+    let mut seen = BTreeSet::new();
     let mut push = |name: &str, increase_bad: bool, decrease_bad: bool| {
+        if !seen.insert(name.to_string()) {
+            return;
+        }
         let (Some(&b), Some(&c)) = (base.get(name), cand.get(name)) else {
             return;
         };
@@ -112,6 +129,15 @@ pub fn diff(
     }
     for name in HARD_COUNTERS_EXACT {
         push(name, true, true);
+    }
+    // Dynamic per-encoding / per-pair counters present in both reports.
+    let dynamic: Vec<String> = base
+        .keys()
+        .filter(|k| cand.contains_key(*k) && is_dynamic_hard_counter(k.as_str()))
+        .cloned()
+        .collect();
+    for name in &dynamic {
+        push(name, true, false);
     }
     DiffOutcome { rows }
 }
@@ -151,5 +177,43 @@ mod tests {
             ("scan.rows_out", 1000.0),
         ]);
         assert!(!diff(&base, &better, 0.05).regressed());
+    }
+
+    #[test]
+    fn gates_per_encoding_decode_and_fallback() {
+        // The total is unchanged but work shifted onto pco: the per-encoding
+        // counter and the per-pair fallback must still flag the regression.
+        let base = report(&[
+            ("decode.total_calls", 100.0),
+            ("decode.vortex.pco.calls", 20.0),
+            ("pushdown_fallback.vortex.filter=>vortex.pco.count", 5.0),
+        ]);
+        let cand = report(&[
+            ("decode.total_calls", 100.0),
+            ("decode.vortex.pco.calls", 40.0),
+            ("pushdown_fallback.vortex.filter=>vortex.pco.count", 11.0),
+        ]);
+        let outcome = diff(&base, &cand, 0.05);
+        assert!(outcome.regressed());
+        assert!(
+            outcome
+                .rows
+                .iter()
+                .any(|r| r.name == "decode.vortex.pco.calls" && r.regressed)
+        );
+        assert!(
+            outcome.rows.iter().any(|r| r.name
+                == "pushdown_fallback.vortex.filter=>vortex.pco.count"
+                && r.regressed)
+        );
+        // The fixed total is gated exactly once, not duplicated by the pattern.
+        assert_eq!(
+            outcome
+                .rows
+                .iter()
+                .filter(|r| r.name == "decode.total_calls")
+                .count(),
+            1
+        );
     }
 }

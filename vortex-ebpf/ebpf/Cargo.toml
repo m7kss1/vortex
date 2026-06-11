@@ -23,6 +23,8 @@ publish = false
 name = "vortex-ebpf-kern"
 path = "src/main.rs"
 
+[workspace]
+
 [dependencies]
 aya-ebpf = "0.1"
 # Note: build profiles are controlled by the workspace root; aya-build always

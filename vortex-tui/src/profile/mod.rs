@@ -29,6 +29,7 @@ use vortex::metrics::profile::diff::DiffOutcome;
 use vortex::metrics::profile::diff::HARD_COUNTERS_DOWN;
 use vortex::metrics::profile::diff::HARD_COUNTERS_EXACT;
 use vortex::metrics::profile::diff::HARD_COUNTERS_UP;
+use vortex::metrics::profile::diff::is_dynamic_hard_counter;
 use vortex::metrics::profile::procfs;
 use vortex::session::VortexSession;
 #[cfg(feature = "profile-ebpf")]
@@ -170,6 +171,22 @@ async fn exec_query_profile(session: &VortexSession, args: QueryProfileArgs) -> 
 
     let wall_ms = start.elapsed().as_secs_f64() * 1.0e3;
     let after = procfs::read_self().map_err(|e| vortex_err!("{e:#}"))?;
+
+    // The `cold.*` section depends on page-cache warmth and is not reproducible
+    // across runs. If the cache was not cold, warn so the numbers aren't trusted
+    // blindly and point at how to get a comparable cold run.
+    let cold_bytes = after.read_bytes.saturating_sub(before.read_bytes);
+    let logical_bytes = after.rchar.saturating_sub(before.rchar);
+    if logical_bytes > 0 && cold_bytes < logical_bytes {
+        let hit = 1.0 - (cold_bytes as f64 / logical_bytes as f64);
+        eprintln!(
+            "vx profile: warning: page cache was ~{:.0}% warm; cold.* metrics are not \
+             reproducible. For a cold run drop caches first (Linux, root):\n    \
+             sync && echo 3 | sudo tee /proc/sys/vm/drop_caches",
+            hit * 100.0
+        );
+    }
+
     #[cfg(feature = "profile-ebpf")]
     let syscall_snapshot = probe
         .map(|p| p.finish().map_err(|e| vortex_err!("{e:#}")))
@@ -250,7 +267,7 @@ fn format_delta(delta: f64) -> String {
 }
 
 fn gate_name(name: &str) -> &'static str {
-    if HARD_COUNTERS_UP.contains(&name) {
+    if HARD_COUNTERS_UP.contains(&name) || is_dynamic_hard_counter(name) {
         "increase"
     } else if HARD_COUNTERS_DOWN.contains(&name) {
         "decrease"

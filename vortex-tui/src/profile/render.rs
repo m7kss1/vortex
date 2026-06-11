@@ -4,10 +4,12 @@
 //! Render the in-process metrics registry (plus procfs deltas and the optional
 //! eBPF syscall snapshot) into the nested JSON profile report.
 //!
-//! The report is `{target, engine, query, wall_ms, metrics}` where `metrics` is
-//! a flat map of dotted keys grouped by section (`scan.*`, `io.*`, `metadata.*`,
-//! `pruning.*`, `filter.*`, `decode.<encoding>.*`, `pushdown_fallback.*`,
-//! `memory.*`, `cold.*`, and — with `--syscalls` — `io.read_*`).
+//! The report is `{target, engine, query, wall_ms, metrics, notes}` where
+//! `metrics` is a flat map of numeric dotted keys grouped by section (`scan.*`,
+//! `io.*`, `metadata.*`, `pruning.*`, `filter.*`, `decode.<encoding>.*`,
+//! `pushdown_fallback.*`, `memory.*`, `cold.*`, and — with `--syscalls` —
+//! `io.read_*`). `notes` is a parallel map of human-readable interpretations for
+//! the non-obvious metrics (kept separate so `metrics` stays purely numeric).
 
 use std::collections::BTreeMap;
 
@@ -289,6 +291,20 @@ fn metrics_map(
             json!(hist_percentile(&s.read_hist, 0.99)),
         );
         put("io.tiny_reads".into(), json!(tiny));
+        // What "tiny" means, so the threshold is self-documenting in the report.
+        put(
+            "io.tiny_read_threshold_bytes".into(),
+            json!(1u64 << TINY_READ_LOG2),
+        );
+        // Per-bucket size breakdown of populated log2 buckets, keyed by the
+        // bucket's lower bound in bytes. Makes the tiny-read source diagnosable:
+        // a spike in `io.read_size_hist.64` is 64..128 B reads, not runtime noise.
+        for (bucket, &cnt) in s.read_hist.iter().enumerate() {
+            if cnt > 0 {
+                let lo = 1u64.checked_shl(bucket as u32).unwrap_or(u64::MAX);
+                put(format!("io.read_size_hist.{lo}"), json!(cnt));
+            }
+        }
         for (enc, p) in &s.pmu {
             put(format!("pmu.{enc}.cycle_samples"), json!(p.cycles));
             put(
@@ -327,6 +343,34 @@ fn metrics_map(
     );
 
     m
+}
+
+/// Human-readable interpretations for the non-obvious metrics, keyed parallel to
+/// the metric they explain. Kept out of `metrics` so that map stays purely
+/// numeric (and diff-friendly). Currently explains the compute-on-encoded
+/// pushdown misses, which are otherwise just an opaque `parent=>child` count.
+fn notes_map(metrics: &[Metric]) -> Map<String, Value> {
+    let mut n = Map::new();
+    for m in metrics
+        .iter()
+        .filter(|m| m.name() == "vortex.canonicalize_fallback")
+    {
+        if let (Some(parent), Some(child), MetricValue::Counter(c)) =
+            (label(m, "parent"), label(m, "child"), m.value())
+        {
+            n.insert(
+                format!("pushdown_fallback.{parent}=>{child}"),
+                json!(format!(
+                    "{parent} could not push compute into {child}: the child was \
+                     canonicalized {} time(s) before the operation ran (compute-on-encoded \
+                     fallback). Lower is better; a non-zero count means the encoding was \
+                     materialized instead of operated on in place.",
+                    c.value()
+                )),
+            );
+        }
+    }
+    n
 }
 
 /// Emit per-conjunct `rows_in`/`rows_kept`/`ms` (+ `selectivity` for filter).
@@ -449,11 +493,13 @@ pub fn render(
     let map: BTreeMap<String, Value> = metrics_map(metrics, before, after, syscalls)
         .into_iter()
         .collect();
+    let notes: BTreeMap<String, Value> = notes_map(metrics).into_iter().collect();
     json!({
         "target": target,
         "engine": engine,
         "query": query,
         "wall_ms": round4(wall_ms),
         "metrics": map,
+        "notes": notes,
     })
 }
