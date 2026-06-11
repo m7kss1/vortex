@@ -77,6 +77,10 @@ tokio = ["vortex-file/tokio"]
 zstd = ["dep:vortex-zstd", "vortex-file/zstd"]
 pretty = ["vortex-array/table-display"]
 serde = ["vortex-array/serde", "vortex-buffer/serde", "vortex-mask/serde"]
+# Compile the Vortex eBPF PMU decode-context marker, so the eBPF
+# sampler can attribute hardware counters per encoding. Format metrics are always
+# available in-process via `vortex-metrics` and need no feature.
+profile-pmu = ["vortex-array/profile-pmu"]
 # This feature enabled unstable encodings for which we don't guarantee stability.
 unstable_encodings = [
     "dep:vortex-tensor",

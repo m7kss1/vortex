@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+# Standalone: builds only for `bpfel-unknown-none`, normally via
+# `vortex-ebpf/build.rs` -> `aya_build`. Requires a nightly toolchain
+# with `rust-src` (see rust-toolchain.toml) and `bpf-linker` on PATH.
+#
+# Map types are `#[path]`-included from `vortex-ebpf/src/types.rs`
+# (a cargo dependency would be circular: that crate's build script builds this
+# one), so there is no path or git dependency here at all.
+
+[package]
+name = "vortex-ebpf-ebpf"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+publish = false
+
+# The bin name must differ from the package name: aya-build 0.1.3 uses
+# `OUT_DIR/<package-name>` as the nested target dir and copies the built bin to
+# `OUT_DIR/<bin-name>`, so identical names collide (EISDIR).
+[[bin]]
+name = "vortex-ebpf-kern"
+path = "src/main.rs"
+
+[dependencies]
+aya-ebpf = "0.1"
+# Note: build profiles are controlled by the workspace root; aya-build always
+# builds this crate with `--release` and forces `-Cdebuginfo=2` (for BTF).

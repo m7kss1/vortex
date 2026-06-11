@@ -9,6 +9,7 @@ members = [
     "vortex-session",
     "vortex-flatbuffers",
     "vortex-metrics",
+    "vortex-ebpf",
     "vortex-io",
     "vortex-proto",
     "vortex-array",
@@ -71,7 +72,7 @@ members = [
     "benchmarks-website/migrate",
     "vortex-geo",
 ]
-exclude = ["java/testfiles", "wasm-test"]
+exclude = ["java/testfiles", "wasm-test", "vortex-ebpf/ebpf"]
 resolver = "2"
 
 [workspace.package]
@@ -116,6 +117,8 @@ async-fs = "2.2.0"
 async-lock = "3.4"
 async-stream = "0.3.6"
 async-trait = "0.1.89"
+aya = "0.13"
+aya-build = "0.1"
 base16ct = "1.0.0"
 bigdecimal = "0.4.8"
 bindgen = "0.72.0"
@@ -181,6 +184,7 @@ jni = { version = "0.22.0" }
 kanal = "0.1.1"
 lasso = { version = "0.7", features = ["multi-threaded"] }
 lending-iterator = "0.1.7"
+libc = "0.2"
 libfuzzer-sys = "0.4"
 libloading = "0.8"
 liblzma = "0.4"
@@ -302,6 +306,7 @@ vortex-json = { version = "0.1.0", path = "./vortex-json", default-features = fa
 vortex-layout = { version = "0.1.0", path = "./vortex-layout", default-features = false }
 vortex-mask = { version = "0.1.0", path = "./vortex-mask", default-features = false }
 vortex-metrics = { version = "0.1.0", path = "./vortex-metrics", default-features = false }
+vortex-ebpf = { version = "0.1.0", path = "./vortex-ebpf", default-features = false }
 vortex-onpair = { version = "0.1.0", path = "./encodings/experimental/onpair", default-features = false }
 vortex-parquet-variant = { version = "0.1.0", path = "./encodings/parquet-variant" }
 vortex-pco = { version = "0.1.0", path = "./encodings/pco", default-features = false }

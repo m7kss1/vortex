@@ -15,6 +15,7 @@
 use std::env::VarError;
 use std::fmt;
 use std::fmt::Display;
+use std::sync::Arc;
 use std::sync::LazyLock;
 #[cfg(debug_assertions)]
 use std::sync::atomic::AtomicUsize;
@@ -26,6 +27,8 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
+use vortex_metrics::profile::MetricsSessionExt;
+use vortex_metrics::profile::ScanProfiler;
 use vortex_session::Ref;
 use vortex_session::SessionExt;
 use vortex_session::VortexSession;
@@ -233,6 +236,13 @@ impl ArrayRef {
             match step {
                 ExecutionStep::ExecuteSlot(i, done) => {
                     let (parent, child) = unsafe { array.take_slot_unchecked(i) }?;
+                    // The parent had no encoded kernel for this child (execute_parent
+                    // already missed in steps 2a/2b), so the child is forced toward
+                    // canonical — a compute-on-encoded pushdown miss.
+                    if let Some(profiler) = ctx.scan_profiler() {
+                        profiler
+                            .record_fallback(encoding_id.as_str(), child.encoding_id().as_str());
+                    }
                     ctx.log(format_args!(
                         "ExecuteSlot({i}): pushing {}, focusing on {}",
                         parent, child
@@ -305,6 +315,9 @@ struct StackFrame {
 #[derive(Debug, Clone)]
 pub struct ExecutionCtx {
     session: VortexSession,
+    /// Resolved once here (not per decode) so the hot path is a field read; `None`
+    /// on a normal scan, `Some` only while a profiler is installed on the session.
+    scan_profiler: Option<Arc<ScanProfiler>>,
     #[cfg(debug_assertions)]
     id: usize,
     #[cfg(debug_assertions)]
@@ -315,6 +328,7 @@ impl ExecutionCtx {
     /// Create a new execution context with the given session.
     pub fn new(session: VortexSession) -> Self {
         Self {
+            scan_profiler: session.scan_profiler(),
             session,
             #[cfg(debug_assertions)]
             id: {
@@ -329,6 +343,12 @@ impl ExecutionCtx {
     /// Get the session associated with this execution context.
     pub fn session(&self) -> &VortexSession {
         &self.session
+    }
+
+    /// The scan profiler installed on the session, if any. Returns `None` on
+    /// normal scans, so callers pay one `Option` check.
+    pub(crate) fn scan_profiler(&self) -> Option<&Arc<ScanProfiler>> {
+        self.scan_profiler.as_ref()
     }
 
     /// Get the session-scoped host allocator for this execution context.

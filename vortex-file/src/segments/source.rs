@@ -69,6 +69,11 @@ pub struct FileSegmentSource {
     events: mpsc::UnboundedSender<ReadEvent>,
     /// The next read request ID.
     next_id: Arc<AtomicUsize>,
+    /// Segment-request metrics (counters are `Arc`-backed, so these share the
+    /// same registered metrics as the driver's `RequestMetrics`).
+    segment_requests: Counter,
+    segment_logical_bytes: Counter,
+    segment_size: Histogram,
 }
 
 impl FileSegmentSource {
@@ -79,6 +84,9 @@ impl FileSegmentSource {
         metrics: RequestMetrics,
     ) -> Self {
         let (send, recv) = mpsc::unbounded();
+        let segment_requests = metrics.segment_requests.clone();
+        let segment_logical_bytes = metrics.segment_logical_bytes.clone();
+        let segment_size = metrics.segment_size.clone();
 
         let max_alignment = segments
             .iter()
@@ -142,6 +150,9 @@ impl FileSegmentSource {
             segments,
             events: send,
             next_id: Arc::new(AtomicUsize::new(0)),
+            segment_requests,
+            segment_logical_bytes,
+            segment_size,
         }
     }
 }
@@ -162,6 +173,13 @@ impl SegmentSource for FileSegmentSource {
             length,
             alignment,
         } = spec;
+
+        // Record the logical segment request (cheap atomic adds on `Arc`-backed
+        // counters; emits even when no profiler reads them — same as the existing
+        // `io.requests.*` metrics).
+        self.segment_requests.add(1);
+        self.segment_logical_bytes.add(length as u64);
+        self.segment_size.update(length as f64);
 
         let (send, recv) = oneshot::channel();
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -248,20 +266,27 @@ pub struct RequestMetrics {
     pub individual_requests: Counter,
     pub coalesced_requests: Counter,
     pub num_requests_coalesced: Histogram,
+    /// Number of logical segment reads requested.
+    pub segment_requests: Counter,
+    /// Sum of logical segment-request lengths (read-amplification numerator).
+    pub segment_logical_bytes: Counter,
+    /// Distribution of logical segment-request sizes (layout granularity).
+    pub segment_size: Histogram,
+    /// Sum of emitted physical-read lengths (read-amplification denominator).
+    pub physical_bytes: Counter,
 }
 
 impl RequestMetrics {
     pub fn new(metrics_registry: &dyn MetricsRegistry, labels: Vec<Label>) -> Self {
+        let builder = || MetricBuilder::new(metrics_registry).add_labels(labels.clone());
         Self {
-            individual_requests: MetricBuilder::new(metrics_registry)
-                .add_labels(labels.clone())
-                .counter("io.requests.individual"),
-            coalesced_requests: MetricBuilder::new(metrics_registry)
-                .add_labels(labels.clone())
-                .counter("io.requests.coalesced"),
-            num_requests_coalesced: MetricBuilder::new(metrics_registry)
-                .add_labels(labels)
-                .histogram("io.requests.coalesced.num_coalesced"),
+            individual_requests: builder().counter("io.requests.individual"),
+            coalesced_requests: builder().counter("io.requests.coalesced"),
+            num_requests_coalesced: builder().histogram("io.requests.coalesced.num_coalesced"),
+            segment_requests: builder().counter("vortex.io.segment_requests"),
+            segment_logical_bytes: builder().counter("vortex.io.segment_logical_bytes"),
+            segment_size: builder().histogram("vortex.io.segment_size"),
+            physical_bytes: builder().counter("vortex.io.physical_bytes"),
         }
     }
 }

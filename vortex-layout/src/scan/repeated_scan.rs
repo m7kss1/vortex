@@ -21,12 +21,14 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_io::runtime::BlockingRuntime;
 use vortex_io::session::RuntimeSessionExt;
+use vortex_metrics::profile::MetricsSessionExt;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReaderRef;
 use crate::scan::filter::FilterExpr;
+use crate::scan::metrics::ScanMetrics;
 use crate::scan::splits::Splits;
 use crate::scan::tasks::TaskContext;
 use crate::scan::tasks::split_exec;
@@ -173,11 +175,18 @@ impl<A: 'static + Send> RepeatedScan<A> {
 
         let mut limit = self.limit;
         let mut tasks = Vec::new();
+        // Build scan metrics once per scan from the profiler installed on the
+        // session (absent on normal scans), shared across split tasks via `Arc`.
+        let metrics = self
+            .session
+            .scan_profiler()
+            .map(|p| Arc::new(ScanMetrics::new(p.registry())));
         let ctx = Arc::new(TaskContext {
             filter: self.filter.clone().map(|f| Arc::new(FilterExpr::new(f))),
             reader: Arc::clone(&self.layout_reader),
             projection: self.projection.clone(),
             mapper: Arc::clone(&self.map_fn),
+            metrics,
         });
 
         for range in ranges {

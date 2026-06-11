@@ -31,6 +31,14 @@ native = [
     "vortex/zstd",
 ]
 unstable_encodings = ["vortex/unstable_encodings"]
+# `vx profile`: in-process format metrics (vortex-metrics) + procfs; the eBPF
+# read-syscall/PMU layers are opt-in at runtime (`--syscalls`/`--pmu`) and need
+# root. Base profiling needs no root, no eBPF, no nightly.
+profile = ["native"]
+# Additionally compile the PMU decode-context marker so `--pmu` can attribute
+# hardware counters per encoding (one-time nightly + bpf-linker setup at build).
+profile-ebpf = ["profile", "dep:vortex-ebpf", "vortex-ebpf/host"]
+profile-pmu = ["profile-ebpf", "vortex/profile-pmu"]
 
 [lib]
 crate-type = ["cdylib", "rlib"]
@@ -70,6 +78,7 @@ tokio = { workspace = true, features = [
     "macros",
 ], optional = true }
 vortex-datafusion = { workspace = true, optional = true }
+vortex-ebpf = { workspace = true, optional = true }
 
 # WASM-only dependencies
 [target.'cfg(target_arch = "wasm32")'.dependencies]

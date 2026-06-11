@@ -5,6 +5,7 @@
 
 //! Vortex metrics
 
+pub mod profile;
 pub mod tracing;
 
 use std::borrow::Cow;

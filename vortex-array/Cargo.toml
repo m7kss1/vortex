@@ -74,9 +74,11 @@ vortex-buffer = { workspace = true, features = ["arrow"] }
 vortex-error = { workspace = true, features = ["flatbuffers"] }
 vortex-flatbuffers = { workspace = true, features = ["array", "dtype"] }
 vortex-mask = { workspace = true }
+vortex-metrics = { workspace = true }
+vortex-ebpf = { workspace = true, optional = true }
 vortex-proto = { workspace = true, features = ["dtype", "expr", "scalar"] }
 vortex-session = { workspace = true }
-vortex-utils = { workspace = true, features = ["dyn-traits"] }
+vortex-utils = { workspace = true, features = ["dyn-traits", "dashmap"] }
 
 [features]
 arbitrary = ["dep:arbitrary", "dep:primitive-types"]
@@ -85,6 +87,11 @@ cudarc = ["dep:cudarc"]
 table-display = ["dep:tabled"]
 _test-harness = ["dep:goldenfile", "dep:rstest", "dep:rstest_reuse"]
 serde = ["dep:serde", "vortex-buffer/serde", "vortex-mask/serde"]
+# Maintain a per-thread "current encoding" eBPF uprobe marker on decode so the
+# Vortex eBPF can attribute PMU samples per encoding. Off by default;
+# compiles to nothing when disabled. Decode economics (calls/rows/bytes/time) are
+# always available in-process via `vortex-metrics` and need no feature.
+profile-pmu = ["dep:vortex-ebpf"]
 
 [dev-dependencies]
 arrow-cast = { workspace = true }

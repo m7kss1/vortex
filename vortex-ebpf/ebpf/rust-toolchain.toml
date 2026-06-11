@@ -1,0 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+# The kernel programs must be built with a nightly toolchain (for `-Z build-std`)
+# that has `rust-src`. `bpf-linker` must also be installed:
+#   rustup component add rust-src --toolchain nightly-2026-03-22
+#   cargo install bpf-linker
+[toolchain]
+channel = "nightly-2026-03-22"
+components = ["rust-src"]

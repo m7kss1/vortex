@@ -5,6 +5,7 @@
 
 use std::ops::BitAnd;
 use std::sync::Arc;
+use std::time::Instant;
 
 use bit_vec::BitVec;
 use futures::FutureExt;
@@ -18,6 +19,7 @@ use vortex_scan::row_mask::RowMask;
 
 use crate::LayoutReader;
 use crate::scan::filter::FilterExpr;
+use crate::scan::metrics::ScanMetrics;
 
 pub type TaskFuture<A> = BoxFuture<'static, VortexResult<A>>;
 
@@ -69,6 +71,7 @@ pub fn split_exec<A: 'static + Send>(
             let reader = Arc::clone(&ctx.reader);
             let filter = Arc::clone(filter);
             let row_range = row_range.clone();
+            let metrics = ctx.metrics.clone();
 
             MaskFuture::new(row_mask.len(), async move {
                 let mut mask = row_mask;
@@ -84,10 +87,24 @@ pub fn split_exec<A: 'static + Send>(
                     // We will re-run the pruning later if the version has changed in the meantime.
                     dynamic_versions[idx] = filter.dynamic_updates(idx).map(|du| du.version());
 
+                    // Pruning selectivity per conjunct, recorded only while a
+                    // profiler is installed (the `true_count`/`Instant` are skipped
+                    // otherwise).
+                    let observed = metrics
+                        .as_ref()
+                        .map(|_| (mask.true_count() as u64, Instant::now()));
                     let conjunct_mask = reader
                         .pruning_evaluation(&row_range, conjunct, mask.clone())?
                         .await?;
                     mask = mask.bitand(&conjunct_mask);
+                    if let (Some(m), Some((rows_in, start))) = (&metrics, observed) {
+                        m.record_prune(
+                            idx as u64,
+                            rows_in,
+                            mask.true_count() as u64,
+                            start.elapsed(),
+                        );
+                    }
                 }
 
                 // Now we loop through the conjuncts in the preferred order and evaluate them.
@@ -117,10 +134,21 @@ pub fn split_exec<A: 'static + Send>(
                         return Ok(mask);
                     }
 
+                    let observed = metrics
+                        .as_ref()
+                        .map(|_| (mask.true_count() as u64, Instant::now()));
                     let conjunct_mask = reader
                         .filter_evaluation(&row_range, conjunct, MaskFuture::ready(mask))?
                         .await?;
                     filter.report_selectivity(idx, conjunct_mask.density());
+                    if let (Some(m), Some((rows_in, start))) = (&metrics, observed) {
+                        m.record_filter(
+                            idx as u64,
+                            rows_in,
+                            conjunct_mask.true_count() as u64,
+                            start.elapsed(),
+                        );
+                    }
 
                     // Filter evaluations return a mask already intersected with the input mask.
                     mask = conjunct_mask;
@@ -137,14 +165,30 @@ pub fn split_exec<A: 'static + Send>(
             .projection_evaluation(&row_range, &ctx.projection, filter_mask.clone())?;
 
     let mapper = Arc::clone(&ctx.mapper);
+    let metrics = ctx.metrics.clone();
     let array_fut = async move {
-        let mask = filter_mask.await?;
-        if mask.all_false() {
-            return Ok(None);
+        // Split timing + the rows it emits (summed into the scan's output rows).
+        // The `Instant`/`len` are only taken while a profiler is installed.
+        if let Some(m) = &metrics {
+            m.split_begin();
         }
+        let start = metrics.as_ref().map(|_| Instant::now());
+        let outcome: VortexResult<(Option<A>, u64)> = async move {
+            let mask = filter_mask.await?;
+            if mask.all_false() {
+                return Ok((None, 0));
+            }
 
-        let array = projection_future.await?;
-        mapper(array).map(Some)
+            let array = projection_future.await?;
+            let rows_out = array.len() as u64;
+            Ok((mapper(array).map(Some)?, rows_out))
+        }
+        .await;
+        if let (Some(m), Some(start)) = (&metrics, start) {
+            let rows_out = outcome.as_ref().map(|(_, r)| *r).unwrap_or(0);
+            m.split_end(start.elapsed(), rows_out);
+        }
+        outcome.map(|(array, _)| array)
     };
 
     Ok(array_fut.boxed())
@@ -162,4 +206,7 @@ pub struct TaskContext<A> {
     pub projection: Expression,
     /// Function that maps into an A.
     pub mapper: Arc<dyn Fn(ArrayRef) -> VortexResult<A> + Send + Sync>,
+    /// In-process scan metrics, present only while a profiler is installed on the
+    /// session.
+    pub metrics: Option<Arc<ScanMetrics>>,
 }

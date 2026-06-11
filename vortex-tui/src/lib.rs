@@ -39,6 +39,8 @@ pub mod convert;
 pub mod datafusion_helper;
 #[cfg(feature = "native")]
 pub mod inspect;
+#[cfg(feature = "profile")]
+pub mod profile;
 #[cfg(feature = "native")]
 pub mod query;
 #[cfg(feature = "native")]
@@ -80,6 +82,9 @@ mod native_cli {
         Query(super::query::QueryArgs),
         /// Display segment information for a Vortex file
         Segments(super::segments::SegmentsArgs),
+        /// Profile the Vortex format with eBPF while running a query (Linux, root)
+        #[cfg(feature = "profile")]
+        Profile(super::profile::ProfileArgs),
     }
 
     impl Commands {
@@ -94,6 +99,8 @@ mod native_cli {
                 Commands::Inspect(args) => &args.file,
                 Commands::Query(args) => &args.file,
                 Commands::Segments(args) => &args.file,
+                #[cfg(feature = "profile")]
+                Commands::Profile(args) => args.file_path(),
             }
         }
     }
@@ -149,6 +156,8 @@ mod native_cli {
             Commands::Inspect(args) => super::inspect::exec_inspect(session, args).await?,
             Commands::Query(args) => super::query::exec_query(session, args).await?,
             Commands::Segments(args) => super::segments::exec_segments(session, args).await?,
+            #[cfg(feature = "profile")]
+            Commands::Profile(args) => super::profile::exec_profile(session, args).await?,
         };
 
         Ok(())

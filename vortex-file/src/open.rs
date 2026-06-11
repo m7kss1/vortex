@@ -24,7 +24,9 @@ use vortex_layout::segments::SharedSegmentSource;
 use vortex_layout::session::LayoutSessionExt;
 use vortex_metrics::DefaultMetricsRegistry;
 use vortex_metrics::Label;
+use vortex_metrics::MetricBuilder;
 use vortex_metrics::MetricsRegistry;
+use vortex_metrics::profile::MetricsSessionExt;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 
@@ -205,8 +207,7 @@ impl VortexOpenOptions {
             .unwrap_or_else(|| Arc::new(NoOpSegmentCache));
 
         let metrics_registry = self
-            .metrics_registry
-            .clone()
+            .profiling_registry()
             .unwrap_or_else(|| Arc::new(DefaultMetricsRegistry::default()));
 
         let footer = if let Some(footer) = self.footer {
@@ -247,6 +248,18 @@ impl VortexOpenOptions {
         ))
     }
 
+    /// The metrics registry to record into. When a [`ScanProfiler`] is installed
+    /// on the session (i.e. while profiling) its registry wins, so IO metrics
+    /// unify with the rest of the profile even if an engine (e.g. DataFusion) set
+    /// its own registry on the open options. Otherwise the explicitly-set
+    /// registry is used; `None` on a normal open.
+    fn profiling_registry(&self) -> Option<Arc<dyn MetricsRegistry>> {
+        self.session
+            .scan_profiler()
+            .map(|p| p.registry())
+            .or_else(|| self.metrics_registry.clone())
+    }
+
     async fn read_footer(&self, read: &dyn VortexReadAt) -> VortexResult<Footer> {
         // Fetch the file size and perform the initial read.
         let file_size = match self.file_size {
@@ -261,12 +274,30 @@ impl VortexOpenOptions {
             initial_read_size = initial_read_size.min(file_size);
         }
 
+        // Footer/metadata read metrics, registered once here and emitted only
+        // when a registry is available — set explicitly on the options or derived
+        // from a profiler installed on the session (i.e. while profiling).
+        let registry = self.profiling_registry();
+        let footer_metrics = registry.as_ref().map(|registry| {
+            (
+                MetricBuilder::new(registry.as_ref()).counter("vortex.io.footer_reads"),
+                MetricBuilder::new(registry.as_ref()).counter("vortex.io.footer_bytes"),
+            )
+        });
+        let record_footer = |bytes: usize| {
+            if let Some((reads, byte_count)) = &footer_metrics {
+                reads.add(1);
+                byte_count.add(bytes as u64);
+            }
+        };
+
         let initial_offset = file_size - initial_read_size as u64;
         let initial_read: ByteBuffer = read
             .read_at(initial_offset, initial_read_size, Alignment::none())
             .await?
             .try_into_host()?
             .await?;
+        record_footer(initial_read.len());
 
         let mut deserializer = Footer::deserializer(initial_read, self.session.clone())
             .with_size(file_size)
@@ -280,6 +311,7 @@ impl VortexOpenOptions {
                         .await?
                         .try_into_host()?
                         .await?;
+                    record_footer(more_data.len());
                     deserializer.prefix_data(more_data);
                 }
                 DeserializeStep::NeedFileSize => unreachable!("We passed file_size above"),

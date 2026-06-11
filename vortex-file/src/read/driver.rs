@@ -169,7 +169,7 @@ impl State {
 
     /// Get the next request, if any.
     fn next(&mut self, coalesce_window: Option<&CoalesceConfig>) -> Option<IoRequest> {
-        match coalesce_window {
+        let io = match coalesce_window {
             None => self.next_uncoalesced().map(|request| {
                 self.metrics.individual_requests.add(1);
                 IoRequest::new_single(request)
@@ -186,7 +186,13 @@ impl State {
                 };
                 IoRequest::new_coalesced(request)
             }),
+        };
+        // Physical bytes actually emitted (read-amplification denominator vs the
+        // logical segment bytes). The request-count metrics are recorded above.
+        if let Some(io) = &io {
+            self.metrics.physical_bytes.add(io.len() as u64);
         }
+        io
     }
 
     /// Find the next uncoalesced request, choosing only polled requests.

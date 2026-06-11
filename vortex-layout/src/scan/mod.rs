@@ -4,6 +4,7 @@
 pub mod arrow;
 mod filter;
 pub mod layout;
+mod metrics;
 pub mod multi;
 pub mod repeated_scan;
 pub mod scan_builder;
