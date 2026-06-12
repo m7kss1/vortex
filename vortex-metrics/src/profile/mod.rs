@@ -78,19 +78,29 @@ impl ScanProfiler {
     /// bytes produced.
     pub fn record_decode(&self, encoding: &str, elapsed: Duration, rows: u64, bytes: u64) {
         let nanos = u64::try_from(elapsed.as_nanos()).unwrap_or(u64::MAX);
-        let handles = self.decode.entry(encoding.to_string()).or_insert_with(|| {
-            let make = |name: &'static str| {
-                MetricBuilder::new(self.registry.as_ref())
-                    .add_label("encoding", encoding.to_string())
-                    .counter(name)
-            };
-            DecodeHandles {
-                calls: make("vortex.decode.calls"),
-                nanos: make("vortex.decode.nanos"),
-                rows: make("vortex.decode.rows"),
-                bytes: make("vortex.decode.bytes"),
-            }
-        });
+        // Fast path: a decode of an already-seen encoding (the common case) reads
+        // the handles without allocating an owned key or holding the shard lock
+        // across the atomic adds.
+        let handles = match self.decode.get(encoding) {
+            Some(handles) => handles.clone(),
+            None => self
+                .decode
+                .entry(encoding.to_string())
+                .or_insert_with(|| {
+                    let make = |name: &'static str| {
+                        MetricBuilder::new(self.registry.as_ref())
+                            .add_label("encoding", encoding.to_string())
+                            .counter(name)
+                    };
+                    DecodeHandles {
+                        calls: make("vortex.decode.calls"),
+                        nanos: make("vortex.decode.nanos"),
+                        rows: make("vortex.decode.rows"),
+                        bytes: make("vortex.decode.bytes"),
+                    }
+                })
+                .clone(),
+        };
         handles.calls.add(1);
         handles.nanos.add(nanos);
         handles.rows.add(rows);

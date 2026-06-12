@@ -105,9 +105,7 @@ impl ScanMetrics {
     /// A split began executing; bumps the peak-concurrency high-water mark.
     pub(crate) fn split_begin(&self) {
         let active = self.split_active.fetch_add(1, Ordering::Relaxed) + 1;
-        if (active as f64) > self.split_peak.value() {
-            self.split_peak.set(active as f64);
-        }
+        self.split_peak.set_max(active as f64);
     }
 
     /// A split finished: record its duration and the rows it emitted (the scan's

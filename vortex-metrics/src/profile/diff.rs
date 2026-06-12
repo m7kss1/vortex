@@ -98,7 +98,7 @@ pub fn diff(
 ) -> DiffOutcome {
     let mut rows = Vec::new();
     let mut seen = BTreeSet::new();
-    let mut push = |name: &str, increase_bad: bool, decrease_bad: bool| {
+    let mut push = |name: &str, increase_bad: bool, decrease_bad: bool, tol: f64| {
         if !seen.insert(name.to_string()) {
             return;
         }
@@ -112,7 +112,7 @@ pub fn diff(
         } else {
             f64::INFINITY
         };
-        let regressed = (increase_bad && delta > tolerance) || (decrease_bad && delta < -tolerance);
+        let regressed = (increase_bad && delta > tol) || (decrease_bad && delta < -tol);
         rows.push(DiffRow {
             name: name.to_string(),
             baseline: b,
@@ -122,13 +122,15 @@ pub fn diff(
         });
     };
     for name in HARD_COUNTERS_UP {
-        push(name, true, false);
+        push(name, true, false, tolerance);
     }
     for name in HARD_COUNTERS_DOWN {
-        push(name, false, true);
+        push(name, false, true, tolerance);
     }
+    // Correctness counters must stay identical across runs on the same query+data,
+    // so any change is a regression regardless of the perf tolerance.
     for name in HARD_COUNTERS_EXACT {
-        push(name, true, true);
+        push(name, true, true, 0.0);
     }
     // Dynamic per-encoding / per-pair counters present in both reports.
     let dynamic: Vec<String> = base
@@ -137,7 +139,7 @@ pub fn diff(
         .cloned()
         .collect();
     for name in &dynamic {
-        push(name, true, false);
+        push(name, true, false, tolerance);
     }
     DiffOutcome { rows }
 }
@@ -177,6 +179,17 @@ mod tests {
             ("scan.rows_out", 1000.0),
         ]);
         assert!(!diff(&base, &better, 0.05).regressed());
+    }
+
+    #[test]
+    fn exact_counters_ignore_tolerance() {
+        let base = report(&[("scan.rows_out", 1000.0), ("filter.rows_kept", 500.0)]);
+        // A 0.4% drift — well under the 5% tolerance — must still regress, because
+        // these counters must be identical for the same query+data.
+        let drifted = report(&[("scan.rows_out", 1004.0), ("filter.rows_kept", 500.0)]);
+        assert!(diff(&base, &drifted, 0.05).regressed());
+        // Identical values do not regress.
+        assert!(!diff(&base, &base, 0.05).regressed());
     }
 
     #[test]

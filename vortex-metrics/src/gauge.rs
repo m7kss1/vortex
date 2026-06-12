@@ -59,9 +59,38 @@ impl Gauge {
         _ = self.0.swap(value.to_bits(), Ordering::AcqRel);
     }
 
+    /// Raises the gauge to `value` if it currently holds less, as a single atomic
+    /// read-modify-write. Use for concurrent high-water marks where a separate
+    /// read-then-[`set`](Self::set) would race and lose updates.
+    pub fn set_max(&self, value: f64) {
+        _ = self
+            .0
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |current| {
+                (value > f64::from_bits(current)).then_some(value.to_bits())
+            });
+    }
+
     /// Returns the current value of the gauge.
     pub fn value(&self) -> f64 {
         let value = self.0.load(Ordering::Acquire);
         f64::from_bits(value)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Gauge;
+
+    #[test]
+    fn set_max_keeps_the_high_water_mark() {
+        let gauge = Gauge::new();
+        gauge.set_max(3.0);
+        assert_eq!(gauge.value(), 3.0);
+        // A lower value must not lower the gauge.
+        gauge.set_max(1.0);
+        assert_eq!(gauge.value(), 3.0);
+        // A higher value raises it.
+        gauge.set_max(5.0);
+        assert_eq!(gauge.value(), 5.0);
     }
 }

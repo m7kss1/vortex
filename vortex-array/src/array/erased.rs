@@ -17,6 +17,7 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 use vortex_mask::Mask;
+use vortex_metrics::profile::ScanProfiler;
 
 use crate::AnyCanonical;
 use crate::Array;
@@ -185,6 +186,61 @@ impl ArrayEq for ArrayRef {
             && self.0.data.dyn_array_eq(other, accuracy)
     }
 }
+
+/// While a profiler is installed, brackets one encoding's decode: it records the
+/// per-encoding economics (wall time, rows, and own-buffer bytes — children are
+/// timed by their own observations) when dropped and, under `profile-pmu`, holds
+/// the marker scope the PMU sampler reads. A no-op otherwise, so a normal scan
+/// pays a single `Option` check.
+struct DecodeObservation {
+    record: Option<DecodeRecord>,
+}
+
+struct DecodeRecord {
+    profiler: Arc<ScanProfiler>,
+    encoding: ArrayId,
+    rows: u64,
+    bytes: u64,
+    start: Instant,
+    #[cfg(feature = "profile-pmu")]
+    _pmu: vortex_ebpf::DecodeScope,
+}
+
+impl DecodeObservation {
+    /// Begin observing `array`'s decode, capturing its shape before the encoding
+    /// consumes it. Returns a no-op observation when no profiler is installed.
+    fn begin(array: &ArrayRef, ctx: &ExecutionCtx) -> Self {
+        let Some(profiler) = ctx.scan_profiler() else {
+            return Self { record: None };
+        };
+        let encoding = array.encoding_id();
+        Self {
+            record: Some(DecodeRecord {
+                profiler: Arc::clone(profiler),
+                encoding,
+                rows: array.len() as u64,
+                bytes: array.buffers().iter().map(|b| b.len() as u64).sum::<u64>(),
+                start: Instant::now(),
+                #[cfg(feature = "profile-pmu")]
+                _pmu: vortex_ebpf::decode_scope(encoding.as_str()),
+            }),
+        }
+    }
+}
+
+impl Drop for DecodeObservation {
+    fn drop(&mut self) {
+        if let Some(record) = &self.record {
+            record.profiler.record_decode(
+                record.encoding.as_str(),
+                record.start.elapsed(),
+                record.rows,
+                record.bytes,
+            );
+        }
+    }
+}
+
 impl ArrayRef {
     /// Returns the length of the array.
     #[inline]
@@ -606,31 +662,10 @@ impl ArrayRef {
     }
 
     pub(crate) fn execute_encoding(self, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        // Per-encoding decode economics, recorded in-process only while a profiler
-        // is installed. `nbytes` is this encoding's own buffers (children are timed
-        // by their own spans). A normal scan pays just the `Option` check.
-        let observed = ctx.scan_profiler().map(|_| {
-            (
-                self.encoding_id(),
-                self.len() as u64,
-                self.buffers().iter().map(|b| b.len() as u64).sum::<u64>(),
-                Instant::now(),
-            )
-        });
-        // `profile-pmu`: maintain the per-thread "current encoding" the PMU
-        // sampler reads; the guard clears it on drop.
-        #[cfg(feature = "profile-pmu")]
-        let _pmu = observed
-            .as_ref()
-            .map(|(enc, ..)| vortex_ebpf::decode_scope(enc.as_str()));
+        let _observation = DecodeObservation::begin(&self, ctx);
         let inner = Arc::as_ptr(&self.0);
         // SAFETY: the Arc outlives the DynArrayData function call
-        let result = unsafe { (&*inner).data.execute(self, ctx) };
-        if let (Some(profiler), Some((enc, rows, nbytes, start))) = (ctx.scan_profiler(), observed)
-        {
-            profiler.record_decode(enc.as_str(), start.elapsed(), rows, nbytes);
-        }
-        result
+        unsafe { (&*inner).data.execute(self, ctx) }
     }
 
     /// Execute a single encoding step without applying `Done`-result postconditions.
@@ -642,30 +677,12 @@ impl ArrayRef {
         self,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<ExecutionResult> {
-        // Per-encoding decode economics; see `execute_encoding`. `None` (no
-        // profiler) is a single branch on the hot path.
-        let observed = ctx.scan_profiler().map(|_| {
-            (
-                self.encoding_id(),
-                self.len() as u64,
-                self.buffers().iter().map(|b| b.len() as u64).sum::<u64>(),
-                Instant::now(),
-            )
-        });
-        #[cfg(feature = "profile-pmu")]
-        let _pmu = observed
-            .as_ref()
-            .map(|(enc, ..)| vortex_ebpf::decode_scope(enc.as_str()));
+        let _observation = DecodeObservation::begin(&self, ctx);
         let inner = Arc::as_ptr(&self.0);
         // SAFETY: `inner` points at the allocation owned by `self.0`. `self` stays alive for the
         // duration of the call, so the pointee remains valid. Avoiding an extra `Arc` clone here
         // preserves uniqueness so execute-time metadata cursors can use `Arc::get_mut`.
-        let result = unsafe { (&*inner).data.execute_unchecked(self, ctx) };
-        if let (Some(profiler), Some((enc, rows, nbytes, start))) = (ctx.scan_profiler(), observed)
-        {
-            profiler.record_decode(enc.as_str(), start.elapsed(), rows, nbytes);
-        }
-        result
+        unsafe { (&*inner).data.execute_unchecked(self, ctx) }
     }
 
     pub fn execute_parent(
