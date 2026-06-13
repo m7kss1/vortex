@@ -10744,6 +10744,7 @@ dependencies = [
  "vortex",
  "vortex-datafusion",
  "vortex-ebpf",
+ "vortex-session",
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",

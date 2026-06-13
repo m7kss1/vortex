@@ -24,16 +24,22 @@ pub fn ebpf_object() -> &'static [u8] {
 }
 
 mod pod {
-    use crate::types::DecodeStack;
-    use crate::types::EncKey;
+    use crate::types::BioKey;
+    use crate::types::ContextKey;
+    use crate::types::ContextStack;
+    use crate::types::OffCpuStart;
+    use crate::types::OffCpuStats;
     use crate::types::PmuStats;
 
     // SAFETY: these are plain `#[repr(C)]` aggregates of explicitly sized
-    // integers/byte arrays with no invariants, safe to read from BPF maps as raw
-    // bytes.
-    unsafe impl aya::Pod for EncKey {}
-    unsafe impl aya::Pod for DecodeStack {}
+    // integers (padding fields are explicit and always zeroed), safe to read from
+    // BPF maps as raw bytes.
+    unsafe impl aya::Pod for ContextKey {}
+    unsafe impl aya::Pod for ContextStack {}
     unsafe impl aya::Pod for PmuStats {}
+    unsafe impl aya::Pod for BioKey {}
+    unsafe impl aya::Pod for OffCpuStats {}
+    unsafe impl aya::Pod for OffCpuStart {}
 }
 
 #[cfg(test)]

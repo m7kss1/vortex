@@ -11,14 +11,22 @@ vx profile query ./vortex-bench/data/tpch/0.1/vortex-compact/lineitem_0.vortex \
   --json /tmp/vortex-profile.json
 ```
 
-With eBPF read syscall stats:
+With the eBPF kernel layers (each opt-in, all need root):
 
 ```bash
 cargo build -p vortex-tui --features profile-ebpf --bin vx
 sudo -E target/debug/vx profile query ./vortex-bench/data/tpch/0.1/vortex-compact/lineitem_0.vortex \
-  --sql "select count(*) from data" \
-  --syscalls \
+  --sql "select count(*) from data where l_quantity > 20" \
+  --syscalls --bio --locks --net \
   --json /tmp/vortex-profile-ebpf.json
+```
+
+Off-CPU and per-encoding PMU additionally need a `profile-pmu` build (it compiles
+the context markers the kernel attributes to):
+
+```bash
+cargo build -p vortex-tui --features profile-pmu --bin vx
+sudo -E target/debug/vx profile query <file> --sql <SQL> --offcpu --pmu --json /tmp/r.json
 ```
 
 Compare two reports:
@@ -27,7 +35,16 @@ Compare two reports:
 vx profile diff /tmp/before.json /tmp/after.json
 ```
 
-PMU is not the default path right now. Use `--syscalls` first.
+The opt-in eBPF layers (compose freely):
+
+| Flag | Build | Adds |
+| --- | --- | --- |
+| `--syscalls` | `profile-ebpf` | read-syscall count, size histogram, **latency** |
+| `--bio` | `profile-ebpf` | block-layer device reads, bytes, service latency |
+| `--locks` | `profile-ebpf` | blocking-futex (lock) wait count + latency |
+| `--net` | `profile-ebpf` | TCP retransmits + connection setup |
+| `--offcpu` | `profile-pmu` | off-CPU (blocked) time per phase + runqueue latency |
+| `--pmu` | `profile-pmu` | per-encoding hardware counters (samples) |
 
 ## What It Measures
 
@@ -38,8 +55,9 @@ Vortex code  ---------------->  vortex-metrics  --------> JSON report
  pruning, fallbacks             counters
 
 Linux kernel ---------------->  vortex-ebpf    --------> same JSON report
- read/pread syscalls            optional
- read size histogram            --syscalls
+ read/block/futex/tcp/sched     optional, root
+ syscall+device+lock+net+       --syscalls --bio
+ offcpu+PMU                     --locks --net --offcpu --pmu
 ```
 
 In-process metrics are the main signal:
@@ -53,15 +71,21 @@ In-process metrics are the main signal:
 - `memory.*`
 - `cold.*`
 
-eBPF syscall metrics are optional:
+eBPF metrics are optional, one group per flag:
 
-- `io.read_syscalls`
-- `io.read_syscall_bytes`
-- `io.read_size_p50_bytes`
-- `io.read_size_p99_bytes`
-- `io.tiny_reads`
-- `io.tiny_read_threshold_bytes`
-- `io.read_size_hist.*`
+- `--syscalls`: `io.read_syscalls`, `io.read_syscall_bytes`,
+  `io.read_size_p50_bytes`, `io.read_size_p99_bytes`, `io.tiny_reads`,
+  `io.tiny_read_threshold_bytes`, `io.read_size_hist.*`,
+  `io.read_latency_p50_us`, `io.read_latency_p99_us`
+- `--bio`: `bio.device_reads`, `bio.device_read_bytes`,
+  `bio.read_latency_p50_ms`, `bio.read_latency_p99_ms`
+- `--locks`: `lock.futex_waits`, `lock.futex_wait_p50_us`,
+  `lock.futex_wait_p99_us`
+- `--net`: `net.tcp_retransmits`, `net.tcp_connections`,
+  `net.connect_latency_p50_ms`, `net.connect_latency_p99_ms`
+- `--offcpu`: `offcpu.<phase>.ms`, `offcpu.<phase>.count`, `offcpu.total_ms`,
+  `sched.runqueue_latency_p50_us`, `sched.runqueue_latency_p99_us`
+- `--pmu`: `pmu.<enc>.*_samples`
 
 The report also has a `notes` object next to `metrics`. It holds short text
 that explains a number when the number alone is not clear (for now only the
@@ -73,10 +97,16 @@ All keys below live inside the `metrics` object of the JSON report. The `Source`
 column says where the number comes from:
 
 - `in-process` — always present, no root, no eBPF.
-- `--syscalls` — present only with the eBPF read-syscall layer (needs root and a
-  `profile-ebpf` build). Missing in the base profile.
-- `--pmu` — present only with the eBPF PMU layer (needs root and a `profile-pmu`
-  build). Missing otherwise.
+- `--syscalls`, `--bio`, `--locks`, `--net` — present only with that eBPF layer
+  (needs root and a `profile-ebpf` build). Missing in the base profile.
+- `--offcpu`, `--pmu` — present only with that eBPF layer (needs root and a
+  `profile-pmu` build, whose context markers the kernel attributes to). Missing
+  otherwise.
+
+Scope: `--syscalls`/`--locks` are pid-scoped (this `vx` process). `--bio`/`--net`
+are **system-wide** for the run (the kernel serves block/TCP work asynchronously
+with no reliable originating pid) — run on an otherwise-idle host. `--offcpu`/
+`--pmu` are scoped in-kernel to the threads with a Vortex phase in flight.
 
 `<enc>` is one encoding id (`vortex.pco`, `vortex.cast`, ...). `<lo>` is a byte
 value. The keys with `<...>` repeat once per encoding / bucket / pair.
@@ -171,21 +201,90 @@ view, so it cannot produce them.
 | `io.tiny_reads` | `--syscalls` | reads below the tiny threshold |
 | `io.tiny_read_threshold_bytes` | `--syscalls` | what "tiny" means (4096 = 4 KiB) |
 | `io.read_size_hist.<lo>` | `--syscalls` | read count in log2 bucket `[<lo>, 2*<lo>)`, only non-empty buckets |
+| `io.read_latency_p50_us` | `--syscalls` | median bare-syscall read latency, µs |
+| `io.read_latency_p99_us` | `--syscalls` | p99 bare-syscall read latency, µs |
 
 `io.read_size_hist.*` is the full size breakdown. Use it to find where the small
 reads sit. Example: a high `io.read_size_hist.32` means many reads in `[32, 64)`
-bytes — metadata, not data.
+bytes — metadata, not data. `io.read_latency_*` is the kernel-side service time
+of the `read`/`pread64` itself (page-cache hit vs disk), separate from the
+in-process time the scan spends queued on the blocking pool.
+
+### block-layer device reads (eBPF only)
+
+These keys exist **only** with `--bio`. They are the read traffic that reached the
+block device *past* the page cache — the honest cold-cache signal. **System-wide**
+for the run (the block layer has no reliable originating pid): run on an idle
+host. A warm-cache run shows `bio.device_reads` near zero; a cold run shows the
+real device IO.
+
+| Key | Source | Meaning |
+| --- | --- | --- |
+| `bio.device_reads` | `--bio` | block-device read requests completed during the run |
+| `bio.device_read_bytes` | `--bio` | bytes those reads moved (`nr_sector × 512`) |
+| `bio.read_latency_p50_ms` | `--bio` | median device read service latency, ms |
+| `bio.read_latency_p99_ms` | `--bio` | p99 device read service latency, ms |
+
+### lock contention (eBPF only)
+
+These keys exist **only** with `--locks`. They time blocking futex waits
+(`FUTEX_WAIT`/`FUTEX_WAIT_BITSET`) — the kernel side of contended
+`parking_lot`/`std` mutexes, the metrics registry lock, segment-cache locks, etc.
+Pid-scoped to this `vx` process.
+
+| Key | Source | Meaning |
+| --- | --- | --- |
+| `lock.futex_waits` | `--locks` | blocking-futex waits during the query |
+| `lock.futex_wait_p50_us` | `--locks` | median wait time, µs |
+| `lock.futex_wait_p99_us` | `--locks` | p99 wait time, µs |
+
+### network (eBPF only)
+
+These keys exist **only** with `--net`. For remote (object-store / S3) reads they
+expose the TCP behaviour the in-process view cannot see (it lives inside
+`object_store`/`reqwest`). **System-wide** for the run. On a local-file query they
+are all zero.
+
+| Key | Source | Meaning |
+| --- | --- | --- |
+| `net.tcp_retransmits` | `--net` | TCP retransmits during the run (network trouble) |
+| `net.tcp_connections` | `--net` | new TCP connections established |
+| `net.connect_latency_p50_ms` | `--net` | median `SYN_SENT`→`ESTABLISHED` time, ms |
+| `net.connect_latency_p99_ms` | `--net` | p99 connection setup time, ms |
+
+### off-CPU and scheduler (eBPF only)
+
+These keys exist **only** with `--offcpu` (`profile-pmu` build, root). Off-CPU is
+the time a thread spent **blocked** (descheduled) while a Vortex phase was in
+flight, attributed to that phase via the context markers — the answer to "is this
+phase compute-bound or waiting?". Runqueue latency is the wakeup→run scheduling
+delay of those threads (CPU oversubscription). `<phase>` is the encoding for a
+decode (`vortex.pco`), else the phase and instance (e.g. `filter.conjunct[0]`).
+
+| Key | Source | Meaning |
+| --- | --- | --- |
+| `offcpu.<phase>.ms` | `--offcpu` | off-CPU (blocked) time attributed to `<phase>`, ms |
+| `offcpu.<phase>.count` | `--offcpu` | off-CPU episodes for `<phase>` |
+| `offcpu.total_ms` | `--offcpu` | off-CPU time over all phases, ms |
+| `sched.runqueue_latency_p50_us` | `--offcpu` | median runqueue (wakeup→run) latency, µs |
+| `sched.runqueue_latency_p99_us` | `--offcpu` | p99 runqueue latency, µs |
 
 ### PMU (eBPF only)
 
 These keys exist **only** with `--pmu` (`profile-pmu` build, root). They are
-samples, not exact counts. Do not use them as a hard regression gate.
+samples, not exact counts. Do not use them as a hard regression gate. Each
+hardware counter is best-effort: counters unavailable on the host (common on
+virtualized / cloud instances, where `perf_event_open` is restricted) are skipped
+with a warning and their keys are absent.
 
 | Key | Source | Meaning |
 | --- | --- | --- |
 | `pmu.<enc>.cycle_samples` | `--pmu` | CPU-cycle samples attributed to this encoding's decode |
 | `pmu.<enc>.instruction_samples` | `--pmu` | retired-instruction samples |
 | `pmu.<enc>.cache_miss_samples` | `--pmu` | cache-miss samples |
+| `pmu.<enc>.branch_miss_samples` | `--pmu` | branch-misprediction samples (FSST/ALP hot spots) |
+| `pmu.<enc>.llc_load_miss_samples` | `--pmu` | last-level-cache load-miss samples (wide bit-packing) |
+| `pmu.<enc>.stalled_cycle_samples` | `--pmu` | backend-stalled-cycle samples (memory-bound decode) |
 
 ## Diff Gate
 
@@ -206,6 +305,13 @@ The per-encoding `decode.<enc>.calls` and per-pair
 `pushdown_fallback.<parent>=><child>.count` are gated by pattern. The grand
 total can stay flat while work shifts onto one encoding; the per-key gate still
 catches it. `cold.*` and `pmu.*` are not gated — they are not reproducible.
+
+The kernel-layer signals added by `--bio`, `--locks`, `--net`, `--offcpu` and the
+`io.read_latency_*` / `sched.*` keys are **not gated** either: they are latencies,
+system-wide counts, or scheduler/blocking timings that depend on host load and
+cache state, not deterministic per-query counters. Use them as diagnostics, not
+as a regression gate. The gated counters stay the deterministic in-process ones
+(plus the `--syscalls` read counts/sizes).
 
 ## How `--syscalls` Works
 
@@ -240,15 +346,24 @@ For base profile:
 - no BPF
 - no root
 
-For `--syscalls`:
+For `--syscalls` / `--bio` / `--locks` / `--net`:
 
 - Linux
 - root or enough `CAP_BPF` / `CAP_PERFMON`
+- a `profile-ebpf` build
 - `bpf-linker` installed:
 
 ```bash
 cargo install bpf-linker
 ```
+
+For `--offcpu` / `--pmu`:
+
+- the above, plus a `profile-pmu` build (`--features profile-pmu`) so the
+  context markers exist for the kernel to attribute to
+- `--pmu` additionally needs the host to expose hardware PMU counters via
+  `perf_event_open`; on many virtualized/cloud instances these are restricted, in
+  which case the unavailable counters are skipped with a warning
 
 For CI/check without BPF toolchain:
 
@@ -261,49 +376,120 @@ syscall stats.
 
 ## Real Workload Example
 
+A TPC-H Q6-style aggregate touches four columns under several predicates — good
+for seeing pushdown, statistics pruning, and lazy compute-on-encoded at once. Run
+with every layer (a `profile-pmu` build, root, cold cache):
+
 ```bash
 FILE=./vortex-bench/data/tpch/0.1/vortex-compact/lineitem_0.vortex
-SQL="select count(*) from data where l_quantity > 20"
+SQL="select sum(l_extendedprice * l_discount) as revenue
+     from data
+     where l_shipdate >= date '1994-01-01' and l_shipdate < date '1995-01-01'
+       and l_discount between 0.05 and 0.07
+       and l_quantity < 24"
 
-cargo build -p vortex-tui --features profile-ebpf --bin vx
+cargo build -p vortex-tui --features profile-pmu --bin vx
+sync && echo 3 | sudo tee /proc/sys/vm/drop_caches
 
-sudo -E target/debug/vx profile query "$FILE" \
-  --sql "$SQL" \
-  --syscalls \
-  --json /tmp/lineitem-syscalls.json
+sudo -E target/debug/vx profile query "$FILE" --sql "$SQL" \
+  --syscalls --bio --locks --net --offcpu --pmu \
+  --json /tmp/q6.json
 ```
 
-Inspect:
-
-```bash
-jq ".metrics | {
-  rows: .[\"scan.rows_out\"],
-  reads: .[\"io.read_syscalls\"],
-  read_bytes: .[\"io.read_syscall_bytes\"],
-  p50: .[\"io.read_size_p50_bytes\"],
-  p99: .[\"io.read_size_p99_bytes\"],
-  tiny: .[\"io.tiny_reads\"]
-}" /tmp/lineitem-syscalls.json
-```
-
-Expected shape:
+`metrics` excerpt (selected keys from the full report; `pmu.*` is absent because
+this cloud host restricts `perf_event_open`):
 
 ```json
 {
-  "rows": 12345,
-  "reads": 42,
-  "read_bytes": 8388608,
-  "p50": 65536,
-  "p99": 1048576,
-  "tiny": 3
+  "scan.rows_out": 11618,
+  "scan.splits": 2,
+  "scan.split_peak_concurrent": 2,
+
+  "pruning.pruned_ratio": 0.0,
+  "pruning.rows_in": 1801716,
+  "pruning.rows_kept": 1801716,
+
+  "filter.rows_in": 722164,
+  "filter.rows_kept": 133210,
+  "filter.selectivity": 0.1845,
+
+  "decode.total_calls": 339,
+  "decode.vortex.pco.calls": 44,
+  "decode.vortex.pco.bytes": 11321212,
+  "decode.vortex.pco.mb_per_sec": 15.9328,
+  "decode.vortex.decimal_byte_parts.calls": 33,
+  "decode.fastlanes.bitpacked.calls": 11,
+  "decode.vortex.filter.calls": 66,
+  "decode.vortex.filter.bytes": 0,
+  "decode.vortex.between.calls": 22,
+  "decode.vortex.between.bytes": 0,
+  "decode.vortex.binary.calls": 77,
+  "decode.vortex.binary.bytes": 0,
+
+  "pushdown_fallback.total": 22,
+  "pushdown_fallback.vortex.filter=>fastlanes.bitpacked.count": 11,
+  "pushdown_fallback.vortex.filter=>vortex.pco.count": 11,
+
+  "io.physical_reads": 12,
+  "io.read_amplification": 1.1329,
+  "io.coalescing_factor_avg": 2.0833,
+  "io.tiny_reads": 138,
+  "io.read_latency_p50_us": 2.048,
+  "io.read_latency_p99_us": 1073741.824,
+
+  "bio.device_reads": 19,
+  "bio.device_read_bytes": 3883008,
+  "bio.read_latency_p99_ms": 2.0972,
+
+  "lock.futex_waits": 773,
+  "lock.futex_wait_p99_us": 33554.432,
+
+  "offcpu.vortex.pco.ms": 0.6625,
+  "offcpu.total_ms": 0.7296,
+  "sched.runqueue_latency_p99_us": 131.072,
+
+  "net.tcp_retransmits": 0,
+  "net.tcp_connections": 0
 }
 ```
 
-Numbers are workload and cache dependent.
+### What the report shows
+
+- **Compute-on-encoded (laziness).** The compute nodes `vortex.filter`,
+  `vortex.between`, `vortex.binary` ran with `bytes: 0` — they evaluated over
+  *encoded* children without materializing their own buffers. Only the stored
+  column encodings (`vortex.pco`, `vortex.decimal_byte_parts`,
+  `fastlanes.bitpacked`) produced real bytes. So most of the predicate work
+  happened without canonicalizing columns.
+- **Pushdown misses (where laziness leaked).** `pushdown_fallback.total` = 22:
+  the row filter could not push compute into `fastlanes.bitpacked` (11×) or
+  `vortex.pco` (11×), so those were canonicalized first (the `notes` object spells
+  this out). Lower is better — this is the concrete signal for "which encoding
+  defeated pushdown", and the per-pair gate in `vx profile diff` catches
+  regressions here.
+- **Pruning was ineffective.** `pruning.pruned_ratio` = 0.0 — zone-map pruning
+  skipped no row range (this SF-0.1 data is not clustered by `l_shipdate`), so the
+  row filter did all the selection: `filter.selectivity` 0.18 cut 722k → 133k, and
+  the query ends at `scan.rows_out` 11 618 (~2 %, the expected Q6 selectivity).
+- **IO.** `io.read_amplification` 1.13 with coalescing factor 2.08 — tight. 138
+  reads are tiny (< 4 KiB) metadata. `io.read_latency_p50_us` 2 µs is the common
+  (cache-served) read; the 1 s p99 is an outlier the size histogram isolates from
+  the bulk.
+- **Kernel cross-check (cold run).** `bio.device_reads` 19 / 3.8 MB is what
+  actually reached the disk past the page cache. `lock.futex_waits` 773 (p99
+  33 ms) is the two concurrent splits contending shared locks. `offcpu.total_ms`
+  0.73, almost all under `vortex.pco`, confirms decode is **compute-bound** — it
+  barely blocks. `net.*` is zero (local file). `pmu.*` is absent: this instance
+  does not expose hardware counters (they appear on a PMU-enabled host).
+
+Numbers are workload, cache, and host dependent.
 
 ## Notes
 
 - Use profile diff for deterministic counters.
-- Do not use PMU as a hard regression gate.
-- `--syscalls` requires root because it loads eBPF programs.
-- If `--syscalls` says the object is stubbed, rebuild without `VORTEX_EBPF_SKIP_BPF`.
+- Do not use PMU (or the other kernel-layer latency/system-wide signals) as a hard
+  regression gate.
+- All eBPF layers require root because they load eBPF programs.
+- `--bio` and `--net` are system-wide for the run; use an idle host.
+- `--offcpu` and `--pmu` need a `profile-pmu` build (the context markers).
+- If a layer says the object is stubbed, rebuild without `VORTEX_EBPF_SKIP_BPF`.

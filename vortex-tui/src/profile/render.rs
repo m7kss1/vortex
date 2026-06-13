@@ -24,12 +24,41 @@ use vortex::metrics::profile::procfs::ProcReading;
 #[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::host::collect::Snapshot;
 #[cfg(feature = "profile-ebpf")]
+use vortex_ebpf::types::BIO_STAT_BYTES;
+#[cfg(feature = "profile-ebpf")]
+use vortex_ebpf::types::BIO_STAT_READS;
+#[cfg(feature = "profile-ebpf")]
+use vortex_ebpf::types::FUTEX_STAT_WAITS;
+#[cfg(feature = "profile-ebpf")]
+use vortex_ebpf::types::NET_STAT_CONNECTIONS;
+#[cfg(feature = "profile-ebpf")]
+use vortex_ebpf::types::NET_STAT_RETRANSMITS;
+#[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::types::READ_STAT_BYTES;
 #[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::types::READ_STAT_COUNT;
 
 #[cfg(not(feature = "profile-ebpf"))]
 type Snapshot = ();
+
+/// Resolve a PMU [`ContextKey`](vortex_ebpf::types::ContextKey) to its metric
+/// name: a decode's `id` is an encoding's interned symbol (resolved via the
+/// process interner); other kinds format their instance index.
+#[cfg(feature = "profile-ebpf")]
+fn ctx_name(key: &vortex_ebpf::types::ContextKey) -> String {
+    use vortex_ebpf::ContextKind;
+    match ContextKind::from_u32(key.kind) {
+        Some(ContextKind::Decode) => vortex_session::registry::Id::resolve_u64(key.id)
+            .map(str::to_owned)
+            .unwrap_or_else(|| format!("decode#{}", key.id)),
+        Some(ContextKind::Scan) => format!("scan[{}]", key.id),
+        Some(ContextKind::Prune) => format!("prune.conjunct[{}]", key.id),
+        Some(ContextKind::Filter) => format!("filter.conjunct[{}]", key.id),
+        Some(ContextKind::IoWait) => format!("io_wait[{}]", key.id),
+        Some(ContextKind::Fallback) => format!("fallback[{}]", key.id),
+        None => format!("kind{}[{}]", key.kind, key.id),
+    }
+}
 
 /// Reads below this size are counted as "tiny" (log2 bucket < 12 == < 4 KiB).
 #[cfg(feature = "profile-ebpf")]
@@ -266,46 +295,64 @@ fn metrics_map(
         }
     }
 
-    // Optional eBPF read-syscall histogram.
+    // Optional eBPF layers; each section is emitted only if its layer was attached.
     #[cfg(feature = "profile-ebpf")]
-    if let Some(s) = syscalls {
-        let count = s
-            .read_stats
-            .get(READ_STAT_COUNT as usize)
-            .copied()
-            .unwrap_or(0);
-        let bytes = s
-            .read_stats
-            .get(READ_STAT_BYTES as usize)
-            .copied()
-            .unwrap_or(0);
-        let tiny: u64 = s.read_hist.iter().take(TINY_READ_LOG2).sum();
-        put("io.read_syscalls".into(), json!(count));
-        put("io.read_syscall_bytes".into(), json!(bytes));
-        put(
-            "io.read_size_p50_bytes".into(),
-            json!(hist_percentile(&s.read_hist, 0.50)),
-        );
-        put(
-            "io.read_size_p99_bytes".into(),
-            json!(hist_percentile(&s.read_hist, 0.99)),
-        );
-        put("io.tiny_reads".into(), json!(tiny));
-        // What "tiny" means, so the threshold is self-documenting in the report.
-        put(
-            "io.tiny_read_threshold_bytes".into(),
-            json!(1u64 << TINY_READ_LOG2),
-        );
-        // Per-bucket size breakdown of populated log2 buckets, keyed by the
-        // bucket's lower bound in bytes. Makes the tiny-read source diagnosable:
-        // a spike in `io.read_size_hist.64` is 64..128 B reads, not runtime noise.
-        for (bucket, &cnt) in s.read_hist.iter().enumerate() {
-            if cnt > 0 {
-                let lo = 1u64.checked_shl(bucket as u32).unwrap_or(u64::MAX);
-                put(format!("io.read_size_hist.{lo}"), json!(cnt));
+    if let Some(snap) = syscalls {
+        // Read-syscall layer (`--syscalls`).
+        if let Some(r) = &snap.read {
+            let count = r
+                .read_stats
+                .get(READ_STAT_COUNT as usize)
+                .copied()
+                .unwrap_or(0);
+            let bytes = r
+                .read_stats
+                .get(READ_STAT_BYTES as usize)
+                .copied()
+                .unwrap_or(0);
+            let tiny: u64 = r.read_hist.iter().take(TINY_READ_LOG2).sum();
+            put("io.read_syscalls".into(), json!(count));
+            put("io.read_syscall_bytes".into(), json!(bytes));
+            put(
+                "io.read_size_p50_bytes".into(),
+                json!(hist_percentile(&r.read_hist, 0.50)),
+            );
+            put(
+                "io.read_size_p99_bytes".into(),
+                json!(hist_percentile(&r.read_hist, 0.99)),
+            );
+            put("io.tiny_reads".into(), json!(tiny));
+            // What "tiny" means, so the threshold is self-documenting in the report.
+            put(
+                "io.tiny_read_threshold_bytes".into(),
+                json!(1u64 << TINY_READ_LOG2),
+            );
+            // Per-bucket size breakdown of populated log2 buckets, keyed by the
+            // bucket's lower bound in bytes. Makes the tiny-read source diagnosable:
+            // a spike in `io.read_size_hist.64` is 64..128 B reads, not runtime noise.
+            for (bucket, &cnt) in r.read_hist.iter().enumerate() {
+                if cnt > 0 {
+                    let lo = 1u64
+                        .checked_shl(u32::try_from(bucket).unwrap_or(u32::MAX))
+                        .unwrap_or(u64::MAX);
+                    put(format!("io.read_size_hist.{lo}"), json!(cnt));
+                }
             }
+            // Bare read-syscall latency (ns buckets → µs): the kernel-side service
+            // time, separate from in-process queueing on the blocking pool.
+            put(
+                "io.read_latency_p50_us".into(),
+                json!(round4(hist_percentile(&r.rdlat_hist, 0.50) / 1.0e3)),
+            );
+            put(
+                "io.read_latency_p99_us".into(),
+                json!(round4(hist_percentile(&r.rdlat_hist, 0.99) / 1.0e3)),
+            );
         }
-        for (enc, p) in &s.pmu {
+
+        // PMU layer (`--pmu`).
+        for (key, p) in &snap.pmu {
+            let enc = ctx_name(key);
             put(format!("pmu.{enc}.cycle_samples"), json!(p.cycles));
             put(
                 format!("pmu.{enc}.instruction_samples"),
@@ -314,6 +361,107 @@ fn metrics_map(
             put(
                 format!("pmu.{enc}.cache_miss_samples"),
                 json!(p.cache_misses),
+            );
+            put(
+                format!("pmu.{enc}.branch_miss_samples"),
+                json!(p.branch_misses),
+            );
+            put(
+                format!("pmu.{enc}.llc_load_miss_samples"),
+                json!(p.llc_load_misses),
+            );
+            put(
+                format!("pmu.{enc}.stalled_cycle_samples"),
+                json!(p.stalled_cycles),
+            );
+        }
+
+        // Block-layer device-read layer (`--bio`): ground truth past the page
+        // cache. The block layer serves reads asynchronously (read-ahead,
+        // writeback) and carries no reliable originating pid, so these are
+        // *system-wide* for the run — absolute device reads/bytes and the
+        // service-latency distribution, which is what answers "is the disk slow".
+        // No ratio against the pid-scoped syscall/logical byte totals is emitted:
+        // mixing system-wide device bytes with per-process bytes is unsound.
+        // Latency buckets are log2 nanoseconds; report as milliseconds.
+        if let Some(b) = &snap.bio {
+            let dev_reads = b.stats.get(BIO_STAT_READS as usize).copied().unwrap_or(0);
+            let dev_bytes = b.stats.get(BIO_STAT_BYTES as usize).copied().unwrap_or(0);
+            put("bio.device_reads".into(), json!(dev_reads));
+            put("bio.device_read_bytes".into(), json!(dev_bytes));
+            put(
+                "bio.read_latency_p50_ms".into(),
+                json!(round4(hist_percentile(&b.lat_hist, 0.50) / 1.0e6)),
+            );
+            put(
+                "bio.read_latency_p99_ms".into(),
+                json!(round4(hist_percentile(&b.lat_hist, 0.99) / 1.0e6)),
+            );
+        }
+
+        // Futex-contention layer (`--locks`): blocking lock-wait time (ns → µs).
+        if let Some(l) = &snap.locks {
+            let waits = l.stats.get(FUTEX_STAT_WAITS as usize).copied().unwrap_or(0);
+            put("lock.futex_waits".into(), json!(waits));
+            put(
+                "lock.futex_wait_p50_us".into(),
+                json!(round4(hist_percentile(&l.wait_hist, 0.50) / 1.0e3)),
+            );
+            put(
+                "lock.futex_wait_p99_us".into(),
+                json!(round4(hist_percentile(&l.wait_hist, 0.99) / 1.0e3)),
+            );
+        }
+
+        // Network layer (`--net`, system-wide): TCP retransmits and connection
+        // setup. Connect latency buckets are log2 nanoseconds (→ milliseconds).
+        if let Some(n) = &snap.net {
+            let retransmits = n
+                .stats
+                .get(NET_STAT_RETRANSMITS as usize)
+                .copied()
+                .unwrap_or(0);
+            let connections = n
+                .stats
+                .get(NET_STAT_CONNECTIONS as usize)
+                .copied()
+                .unwrap_or(0);
+            put("net.tcp_retransmits".into(), json!(retransmits));
+            put("net.tcp_connections".into(), json!(connections));
+            put(
+                "net.connect_latency_p50_ms".into(),
+                json!(round4(hist_percentile(&n.connect_lat_hist, 0.50) / 1.0e6)),
+            );
+            put(
+                "net.connect_latency_p99_ms".into(),
+                json!(round4(hist_percentile(&n.connect_lat_hist, 0.99) / 1.0e6)),
+            );
+        }
+
+        // Off-CPU / scheduler layer (`--offcpu`): blocked time attributed to the
+        // Vortex phase in flight, plus runqueue latency (ns buckets → µs).
+        if let Some(o) = &snap.offcpu {
+            let mut total_ns = 0u64;
+            for (key, s) in &o.stats {
+                let name = ctx_name(key);
+                put(
+                    format!("offcpu.{name}.ms"),
+                    json!(round4(s.total_ns as f64 / 1.0e6)),
+                );
+                put(format!("offcpu.{name}.count"), json!(s.count));
+                total_ns += s.total_ns;
+            }
+            put(
+                "offcpu.total_ms".into(),
+                json!(round4(total_ns as f64 / 1.0e6)),
+            );
+            put(
+                "sched.runqueue_latency_p50_us".into(),
+                json!(round4(hist_percentile(&o.runq_hist, 0.50) / 1.0e3)),
+            );
+            put(
+                "sched.runqueue_latency_p99_us".into(),
+                json!(round4(hist_percentile(&o.runq_hist, 0.99) / 1.0e3)),
             );
         }
     }

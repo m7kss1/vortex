@@ -35,6 +35,8 @@ use vortex::session::VortexSession;
 #[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::host::probe::Probe;
 #[cfg(feature = "profile-ebpf")]
+use vortex_ebpf::host::probe::ProbeOptions;
+#[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::host::probe::is_root;
 
 use crate::datafusion_helper::execute_vortex_query;
@@ -72,6 +74,41 @@ pub struct QueryProfileArgs {
     #[cfg(feature = "profile-ebpf")]
     #[arg(long)]
     pub syscalls: bool,
+
+    /// Attach the eBPF block-layer read tracepoints: device reads, bytes, and
+    /// service-latency distribution past the page cache. Needs root; the block
+    /// layer carries no reliable originating pid, so these counts are system-wide
+    /// for the run — use an otherwise-idle host.
+    #[cfg(feature = "profile-ebpf")]
+    #[arg(long)]
+    pub bio: bool,
+
+    /// Attach the eBPF blocking-futex tracepoints: lock-wait count and latency
+    /// distribution (parking_lot/std mutexes, the registry lock, etc.). Pid-scoped.
+    /// Needs root.
+    #[cfg(feature = "profile-ebpf")]
+    #[arg(long)]
+    pub locks: bool,
+
+    /// Attach the eBPF TCP tracepoints: retransmits and connection setup, for
+    /// remote (object-store) reads. System-wide for the run. Needs root.
+    #[cfg(feature = "profile-ebpf")]
+    #[arg(long)]
+    pub net: bool,
+
+    /// Attach the eBPF scheduler tracepoints: off-CPU (blocked) time and runqueue
+    /// latency, attributed to the Vortex phase in flight. Needs root and a
+    /// `profile-pmu` build (the context markers maintain the per-thread stack).
+    #[cfg(feature = "profile-ebpf")]
+    #[arg(long)]
+    pub offcpu: bool,
+
+    /// Attach the eBPF per-encoding PMU samplers (cycles, instructions, cache /
+    /// branch / LLC misses, stalled cycles). Needs root and a `profile-pmu` build;
+    /// hardware counters may be unavailable on virtualized hosts.
+    #[cfg(feature = "profile-ebpf")]
+    #[arg(long)]
+    pub pmu: bool,
 }
 
 /// Arguments for `vx profile diff`.
@@ -146,20 +183,29 @@ async fn exec_query_profile(session: &VortexSession, args: QueryProfileArgs) -> 
     let profiler = Arc::new(ScanProfiler::new(Arc::clone(&registry)));
     let session = session.clone().with_scan_profiler(profiler);
 
-    // Optional eBPF read-syscall layer, attached to our own pid for the duration
-    // of the query.
+    // Optional eBPF layers, attached for the duration of the query.
     #[cfg(feature = "profile-ebpf")]
-    let probe = if args.syscalls {
-        if !is_root() {
-            let cmd: Vec<String> = std::env::args().collect();
-            vortex_bail!(
-                "--syscalls needs root to load eBPF (CAP_BPF+CAP_PERFMON). Re-run with:\n    sudo -E {}",
-                cmd.join(" ")
-            );
+    let probe = {
+        let opts = ProbeOptions {
+            syscalls: args.syscalls,
+            bio: args.bio,
+            locks: args.locks,
+            net: args.net,
+            offcpu: args.offcpu,
+            pmu: args.pmu,
+        };
+        if opts.any() {
+            if !is_root() {
+                let cmd: Vec<String> = std::env::args().collect();
+                vortex_bail!(
+                    "eBPF layers need root to load (CAP_BPF+CAP_PERFMON). Re-run with:\n    sudo -E {}",
+                    cmd.join(" ")
+                );
+            }
+            Some(Probe::attach(opts).map_err(|e| vortex_err!("{e:#}"))?)
+        } else {
+            None
         }
-        Some(Probe::attach_syscalls().map_err(|e| vortex_err!("{e:#}"))?)
-    } else {
-        None
     };
 
     let before = procfs::read_self().map_err(|e| vortex_err!("{e:#}"))?;

@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::OnceLock;
 
+use lasso::Key;
 use lasso::Spur;
 use lasso::ThreadedRodeo;
 use parking_lot::RwLock;
@@ -49,6 +50,24 @@ impl Id {
         // SAFETY: INTERNER is 'static and its arena is append-only, so resolved string
         // pointers are stable for the lifetime of the program.
         unsafe { &*(s as *const str) }
+    }
+
+    /// The interned symbol as an opaque `u64`, stable within a process run.
+    ///
+    /// Round-trips through [`Id::resolve_u64`]. Used to ship an `Id` across an
+    /// ABI boundary that cannot carry the type itself (e.g. the eBPF context
+    /// marker passes this by register and the host resolves the name back).
+    pub fn as_u64(&self) -> u64 {
+        self.0.into_usize() as u64
+    }
+
+    /// Resolve a `u64` produced by [`Id::as_u64`] back to its interned string,
+    /// or `None` if it does not name an interned value in this process.
+    pub fn resolve_u64(value: u64) -> Option<&'static str> {
+        let key = Spur::try_from_usize(usize::try_from(value).ok()?)?;
+        let s = INTERNER.try_resolve(&key)?;
+        // SAFETY: as in `as_str` — INTERNER is 'static and append-only.
+        Some(unsafe { &*(s as *const str) })
     }
 }
 

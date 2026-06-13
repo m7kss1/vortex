@@ -203,7 +203,7 @@ struct DecodeRecord {
     bytes: u64,
     start: Instant,
     #[cfg(feature = "profile-pmu")]
-    _pmu: vortex_ebpf::DecodeScope,
+    _pmu: vortex_ebpf::ContextScope,
 }
 
 impl DecodeObservation {
@@ -222,7 +222,7 @@ impl DecodeObservation {
                 bytes: array.buffers().iter().map(|b| b.len() as u64).sum::<u64>(),
                 start: Instant::now(),
                 #[cfg(feature = "profile-pmu")]
-                _pmu: vortex_ebpf::decode_scope(encoding.as_str()),
+                _pmu: vortex_ebpf::decode_scope(encoding.as_u64()),
             }),
         }
     }
