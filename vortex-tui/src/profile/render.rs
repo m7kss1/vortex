@@ -4,12 +4,15 @@
 //! Render the in-process metrics registry (plus procfs deltas and the optional
 //! eBPF syscall snapshot) into the nested JSON profile report.
 //!
-//! The report is `{target, engine, query, wall_ms, metrics, notes}` where
-//! `metrics` is a flat map of numeric dotted keys grouped by section (`scan.*`,
-//! `io.*`, `metadata.*`, `pruning.*`, `filter.*`, `decode.<encoding>.*`,
-//! `pushdown_fallback.*`, `memory.*`, `cold.*`, and — with `--syscalls` —
-//! `io.read_*`). `notes` is a parallel map of human-readable interpretations for
-//! the non-obvious metrics (kept separate so `metrics` stays purely numeric).
+//! The report is `{schema_version, target, engine, query, wall_ms, metrics,
+//! engine_details, notes}` where `metrics` is a flat map of numeric dotted keys
+//! grouped by section (`scan.*`, `io.*`, `metadata.*`, `pruning.*`, `filter.*`,
+//! `decode.<encoding>.*`, `pushdown_fallback.*`, `memory.*`, `cold.*`, and —
+//! with `--syscalls` — `io.read_*`). `engine_details` holds engine-internal
+//! introspection (empty for DataFusion today) and is ignored by `vx profile
+//! diff`, so `metrics` stays purely Vortex-format. `notes` is a parallel map of
+//! human-readable interpretations for the non-obvious metrics (kept separate so
+//! `metrics` stays purely numeric).
 
 use std::collections::BTreeMap;
 
@@ -21,8 +24,6 @@ use vortex::metrics::MetricValue;
 #[cfg(feature = "profile-ebpf")]
 use vortex::metrics::profile::hist_percentile;
 use vortex::metrics::profile::procfs::ProcReading;
-#[cfg(feature = "profile-ebpf")]
-use vortex_ebpf::host::collect::Snapshot;
 #[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::types::BIO_STAT_BYTES;
 #[cfg(feature = "profile-ebpf")]
@@ -38,8 +39,9 @@ use vortex_ebpf::types::READ_STAT_BYTES;
 #[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::types::READ_STAT_COUNT;
 
-#[cfg(not(feature = "profile-ebpf"))]
-type Snapshot = ();
+use super::engine::EngineRunOutput;
+use super::run::ProfileRunOutput;
+use super::run::Snapshot;
 
 /// Resolve a PMU [`ContextKey`](vortex_ebpf::types::ContextKey) to its metric
 /// name: a decode's `id` is an encoding's interned symbol (resolved via the
@@ -625,29 +627,110 @@ fn histogram_pcts(metrics: &[Metric], name: &str) -> Option<(f64, f64)> {
         })
 }
 
+/// Profile report schema version. Bumped when the report shape changes;
+/// `vx profile diff` reads only `metrics`, so additive top-level keys are safe.
+const SCHEMA_VERSION: u32 = 1;
+
+/// Everything needed to render one profile report.
+pub(super) struct ProfileReportInput<'a> {
+    pub(super) target: &'a str,
+    pub(super) query: &'a str,
+    pub(super) engine: EngineRunOutput,
+    pub(super) run: ProfileRunOutput,
+}
+
 /// Render the full nested report.
-#[allow(clippy::too_many_arguments)]
-pub fn render(
-    target: &str,
-    engine: &str,
-    query: &str,
-    wall_ms: f64,
-    metrics: &[Metric],
-    before: &ProcReading,
-    after: &ProcReading,
-    syscalls: Option<&Snapshot>,
-) -> Value {
+pub(super) fn render(input: ProfileReportInput<'_>) -> Value {
+    let ProfileReportInput {
+        target,
+        query,
+        engine,
+        run,
+    } = input;
     // BTreeMap → sorted keys for stable, diff-friendly output.
-    let map: BTreeMap<String, Value> = metrics_map(metrics, before, after, syscalls)
-        .into_iter()
-        .collect();
-    let notes: BTreeMap<String, Value> = notes_map(metrics).into_iter().collect();
+    let map: BTreeMap<String, Value> = metrics_map(
+        &run.metrics,
+        &run.before_procfs,
+        &run.after_procfs,
+        run.ebpf_snapshot.as_ref(),
+    )
+    .into_iter()
+    .collect();
+    let notes: BTreeMap<String, Value> = notes_map(&run.metrics).into_iter().collect();
     json!({
+        "schema_version": SCHEMA_VERSION,
         "target": target,
-        "engine": engine,
+        "engine": engine.engine_name,
         "query": query,
-        "wall_ms": round4(wall_ms),
+        "wall_ms": round4(run.wall_ms),
         "metrics": map,
+        "engine_details": Value::Object(engine.details),
         "notes": notes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::Map;
+    use serde_json::json;
+
+    use super::ProcReading;
+    use super::ProfileReportInput;
+    use super::render;
+    use crate::profile::engine::EngineRunOutput;
+    use crate::profile::run::ProfileRunOutput;
+
+    fn run_output() -> ProfileRunOutput {
+        ProfileRunOutput {
+            wall_ms: 12.5,
+            metrics: Vec::new(),
+            before_procfs: ProcReading::default(),
+            after_procfs: ProcReading::default(),
+            ebpf_snapshot: None,
+        }
+    }
+
+    #[test]
+    fn report_keeps_stable_top_level_shape() {
+        let report = render(ProfileReportInput {
+            target: "t.vortex",
+            query: "SELECT 1",
+            engine: EngineRunOutput::empty("datafusion"),
+            run: run_output(),
+        });
+        let obj = report.as_object().expect("report is an object");
+        for key in [
+            "schema_version",
+            "target",
+            "engine",
+            "query",
+            "wall_ms",
+            "metrics",
+            "engine_details",
+            "notes",
+        ] {
+            assert!(obj.contains_key(key), "missing key {key}");
+        }
+        assert_eq!(obj["engine"], json!("datafusion"));
+        assert_eq!(obj["engine_details"], json!({}));
+    }
+
+    #[test]
+    fn engine_details_render_but_stay_out_of_metrics() {
+        let mut details = Map::new();
+        details.insert("cache_hits".into(), json!(7));
+        let report = render(ProfileReportInput {
+            target: "t.vortex",
+            query: "SELECT 1",
+            engine: EngineRunOutput {
+                engine_name: "duckdb",
+                details,
+            },
+            run: run_output(),
+        });
+        assert_eq!(report["engine"], json!("duckdb"));
+        assert_eq!(report["engine_details"]["cache_hits"], json!(7));
+        let metrics = report["metrics"].as_object().expect("metrics object");
+        assert!(metrics.keys().all(|k| !k.contains("cache_hits")));
+    }
 }

@@ -127,16 +127,51 @@ impl std::fmt::Debug for ScanProfiler {
     }
 }
 
-/// Session var carrying the active [`ScanProfiler`].
-struct ScanProfilerVar(Arc<ScanProfiler>);
+/// Shared profiling context published on a [`VortexSession`] while profiling.
+/// Owns the one registry every subsystem records into (scan / decode / IO today,
+/// engine adapters later) plus the [`ScanProfiler`] derived from it.
+pub struct ProfileContext {
+    registry: Arc<dyn MetricsRegistry>,
+    scan: Arc<ScanProfiler>,
+}
 
-impl std::fmt::Debug for ScanProfilerVar {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ScanProfilerVar").finish_non_exhaustive()
+impl ProfileContext {
+    /// Build a context whose scan profiler shares `registry`. Upholds the
+    /// invariant that [`registry`](Self::registry) and
+    /// [`scan`](Self::scan)`.registry()` are the same registry, so every
+    /// subsystem unifies into one snapshot.
+    pub fn new(registry: Arc<dyn MetricsRegistry>) -> Self {
+        let scan = Arc::new(ScanProfiler::new(Arc::clone(&registry)));
+        Self { registry, scan }
+    }
+
+    /// The shared registry. Equal to [`scan`](Self::scan)`.registry()`.
+    pub fn registry(&self) -> Arc<dyn MetricsRegistry> {
+        Arc::clone(&self.registry)
+    }
+
+    /// The scan profiler.
+    pub fn scan(&self) -> Arc<ScanProfiler> {
+        Arc::clone(&self.scan)
     }
 }
 
-impl SessionVar for ScanProfilerVar {
+impl std::fmt::Debug for ProfileContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileContext").finish_non_exhaustive()
+    }
+}
+
+/// Session var carrying the active [`ProfileContext`].
+struct ProfileContextVar(Arc<ProfileContext>);
+
+impl std::fmt::Debug for ProfileContextVar {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProfileContextVar").finish_non_exhaustive()
+    }
+}
+
+impl SessionVar for ProfileContextVar {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -146,23 +181,76 @@ impl SessionVar for ScanProfilerVar {
     }
 }
 
-/// Publishes / reads the [`ScanProfiler`] on a [`VortexSession`]. A profiler
-/// installs one before running a query; executors and scan/IO layers read it
-/// back to register metrics into the same registry.
+/// Publishes / reads the [`ProfileContext`] on a [`VortexSession`]. A profiler
+/// installs one before running a query; executors and scan / IO layers read the
+/// [`ScanProfiler`] back to register metrics into the same registry.
 pub trait MetricsSessionExt {
-    /// Install `profiler` so the scan emits format metrics.
-    fn with_scan_profiler(self, profiler: Arc<ScanProfiler>) -> Self;
+    /// Install `ctx` so the scan emits format metrics.
+    fn with_profile_context(self, ctx: Arc<ProfileContext>) -> Self;
 
-    /// The active profiler, if one was installed.
+    /// The active profile context, if one was installed.
+    fn profile_context(&self) -> Option<Arc<ProfileContext>>;
+
+    /// The active scan profiler, if any. Resolved from the profile context, so
+    /// existing scan / decode / IO hooks read it unchanged.
     fn scan_profiler(&self) -> Option<Arc<ScanProfiler>>;
 }
 
 impl MetricsSessionExt for VortexSession {
-    fn with_scan_profiler(self, profiler: Arc<ScanProfiler>) -> Self {
-        self.with_some(ScanProfilerVar(profiler))
+    fn with_profile_context(self, ctx: Arc<ProfileContext>) -> Self {
+        self.with_some(ProfileContextVar(ctx))
+    }
+
+    fn profile_context(&self) -> Option<Arc<ProfileContext>> {
+        self.get_opt::<ProfileContextVar>()
+            .map(|v| Arc::clone(&v.0))
     }
 
     fn scan_profiler(&self) -> Option<Arc<ScanProfiler>> {
-        self.get_opt::<ScanProfilerVar>().map(|v| Arc::clone(&v.0))
+        self.profile_context().map(|c| c.scan())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use vortex_session::VortexSession;
+
+    use super::MetricsSessionExt;
+    use super::ProfileContext;
+    use crate::DefaultMetricsRegistry;
+    use crate::MetricsRegistry;
+
+    fn context() -> Arc<ProfileContext> {
+        let registry: Arc<dyn MetricsRegistry> = Arc::new(DefaultMetricsRegistry::default());
+        Arc::new(ProfileContext::new(registry))
+    }
+
+    #[test]
+    fn context_round_trips_through_session() {
+        let ctx = context();
+        let session = VortexSession::empty().with_profile_context(Arc::clone(&ctx));
+        let read = session.profile_context().expect("context installed");
+        assert!(Arc::ptr_eq(&read, &ctx));
+    }
+
+    #[test]
+    fn scan_profiler_resolves_from_context() {
+        let ctx = context();
+        let session = VortexSession::empty().with_profile_context(Arc::clone(&ctx));
+        let scan = session.scan_profiler().expect("scan profiler installed");
+        assert!(Arc::ptr_eq(&scan, &ctx.scan()));
+    }
+
+    #[test]
+    fn context_registry_is_scan_registry() {
+        let ctx = context();
+        assert!(Arc::ptr_eq(&ctx.registry(), &ctx.scan().registry()));
+    }
+
+    #[test]
+    fn scan_profiler_absent_without_context() {
+        assert!(VortexSession::empty().scan_profiler().is_none());
     }
 }

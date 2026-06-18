@@ -5,41 +5,36 @@
 //!
 //! Format-semantic metrics (decode economics, pruning, filter, IO, splits,
 //! pushdown misses) are collected **in-process** through Vortex's own
-//! `vortex-metrics`: `vx` installs a [`ScanProfiler`] on the session, runs the
+//! `vortex-metrics`: `vx` installs a profile context on the session, runs the
 //! query, and reads the registry back. The base report needs no root, no eBPF
 //! and no special build. `--syscalls` adds the eBPF read-syscall histogram and
 //! `--pmu` adds per-encoding hardware counters (both need root; `--pmu`
 //! additionally needs a `profile-pmu` build for the decode marker).
 
+mod engine;
 mod render;
+mod run;
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Instant;
 
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
-use vortex::metrics::DefaultMetricsRegistry;
-use vortex::metrics::MetricsRegistry;
-use vortex::metrics::profile::MetricsSessionExt;
-use vortex::metrics::profile::ScanProfiler;
 use vortex::metrics::profile::diff;
 use vortex::metrics::profile::diff::DiffOutcome;
 use vortex::metrics::profile::diff::HARD_COUNTERS_DOWN;
 use vortex::metrics::profile::diff::HARD_COUNTERS_EXACT;
 use vortex::metrics::profile::diff::HARD_COUNTERS_UP;
 use vortex::metrics::profile::diff::is_dynamic_hard_counter;
-use vortex::metrics::profile::procfs;
 use vortex::session::VortexSession;
 #[cfg(feature = "profile-ebpf")]
-use vortex_ebpf::host::probe::Probe;
-#[cfg(feature = "profile-ebpf")]
 use vortex_ebpf::host::probe::ProbeOptions;
-#[cfg(feature = "profile-ebpf")]
-use vortex_ebpf::host::probe::is_root;
 
-use crate::datafusion_helper::execute_vortex_query;
+use crate::profile::engine::EngineRunInput;
+use crate::profile::engine::QueryEngine;
+use crate::profile::render::ProfileReportInput;
+use crate::profile::run::ProfileRun;
+use crate::profile::run::ProfileRunOutput;
 
 /// `vx profile` arguments.
 #[derive(Debug, clap::Parser)]
@@ -176,80 +171,41 @@ async fn exec_query_profile(session: &VortexSession, args: QueryProfileArgs) -> 
         .and_then(|n| n.to_str())
         .unwrap_or(file_path);
 
-    // Install a profiler on the session: the executor (decode/pushdown), the
-    // layout scan (prune/filter/splits/rows_out) and the file IO all register
-    // into this one registry.
-    let registry: Arc<dyn MetricsRegistry> = Arc::new(DefaultMetricsRegistry::default());
-    let profiler = Arc::new(ScanProfiler::new(Arc::clone(&registry)));
-    let session = session.clone().with_scan_profiler(profiler);
-
-    // Optional eBPF layers, attached for the duration of the query.
     #[cfg(feature = "profile-ebpf")]
-    let probe = {
-        let opts = ProbeOptions {
-            syscalls: args.syscalls,
-            bio: args.bio,
-            locks: args.locks,
-            net: args.net,
-            offcpu: args.offcpu,
-            pmu: args.pmu,
-        };
-        if opts.any() {
-            if !is_root() {
-                let cmd: Vec<String> = std::env::args().collect();
-                vortex_bail!(
-                    "eBPF layers need root to load (CAP_BPF+CAP_PERFMON). Re-run with:\n    sudo -E {}",
-                    cmd.join(" ")
-                );
-            }
-            Some(Probe::attach(opts).map_err(|e| vortex_err!("{e:#}"))?)
-        } else {
-            None
-        }
+    let probe_opts = ProbeOptions {
+        syscalls: args.syscalls,
+        bio: args.bio,
+        locks: args.locks,
+        net: args.net,
+        offcpu: args.offcpu,
+        pmu: args.pmu,
     };
 
-    let before = procfs::read_self().map_err(|e| vortex_err!("{e:#}"))?;
-    let start = Instant::now();
-
-    execute_vortex_query(&session, file_path, &args.sql)
-        .await
-        .map_err(|e| vortex_err!("{e}"))?;
-
-    let wall_ms = start.elapsed().as_secs_f64() * 1.0e3;
-    let after = procfs::read_self().map_err(|e| vortex_err!("{e:#}"))?;
-
-    // The `cold.*` section depends on page-cache warmth and is not reproducible
-    // across runs. If the cache was not cold, warn so the numbers aren't trusted
-    // blindly and point at how to get a comparable cold run.
-    let cold_bytes = after.read_bytes.saturating_sub(before.read_bytes);
-    let logical_bytes = after.rchar.saturating_sub(before.rchar);
-    if logical_bytes > 0 && cold_bytes < logical_bytes {
-        let hit = 1.0 - (cold_bytes as f64 / logical_bytes as f64);
-        eprintln!(
-            "vx profile: warning: page cache was ~{:.0}% warm; cold.* metrics are not \
-             reproducible. For a cold run drop caches first (Linux, root):\n    \
-             sync && echo 3 | sudo tee /proc/sys/vm/drop_caches",
-            hit * 100.0
-        );
-    }
-
+    // Bracket the engine run with the Vortex profile context, procfs and eBPF.
+    // The executor (decode/pushdown), the layout scan (prune/filter/splits/
+    // rows_out) and the file IO all register into the context's one registry.
     #[cfg(feature = "profile-ebpf")]
-    let syscall_snapshot = probe
-        .map(|p| p.finish().map_err(|e| vortex_err!("{e:#}")))
-        .transpose()?;
+    let (session, run) = ProfileRun::begin(session, probe_opts)?;
     #[cfg(not(feature = "profile-ebpf"))]
-    let syscall_snapshot = None;
+    let (session, run) = ProfileRun::begin(session)?;
 
-    let report = render::render(
+    let engine = QueryEngine::DataFusion
+        .run(EngineRunInput {
+            session: &session,
+            file_path,
+            sql: &args.sql,
+        })
+        .await?;
+
+    let run = run.finish()?;
+    warn_if_cache_warm(&run);
+
+    let report = render::render(ProfileReportInput {
         target,
-        "datafusion",
-        &args.sql,
-        wall_ms,
-        &registry.snapshot(),
-        &before,
-        &after,
-        syscall_snapshot.as_ref(),
-    );
+        query: &args.sql,
+        engine,
+        run,
+    });
     let pretty = serde_json::to_string_pretty(&report)
         .map_err(|e| vortex_err!("serializing report: {e}"))?;
 
@@ -261,6 +217,29 @@ async fn exec_query_profile(session: &VortexSession, args: QueryProfileArgs) -> 
         None => println!("{pretty}"),
     }
     Ok(())
+}
+
+/// The `cold.*` section depends on page-cache warmth and is not reproducible
+/// across runs. If the cache was not cold, warn so the numbers aren't trusted
+/// blindly and point at how to get a comparable cold run.
+fn warn_if_cache_warm(run: &ProfileRunOutput) {
+    let cold_bytes = run
+        .after_procfs
+        .read_bytes
+        .saturating_sub(run.before_procfs.read_bytes);
+    let logical_bytes = run
+        .after_procfs
+        .rchar
+        .saturating_sub(run.before_procfs.rchar);
+    if logical_bytes > 0 && cold_bytes < logical_bytes {
+        let hit = 1.0 - (cold_bytes as f64 / logical_bytes as f64);
+        eprintln!(
+            "vx profile: warning: page cache was ~{:.0}% warm; cold.* metrics are not \
+             reproducible. For a cold run drop caches first (Linux, root):\n    \
+             sync && echo 3 | sudo tee /proc/sys/vm/drop_caches",
+            hit * 100.0
+        );
+    }
 }
 
 fn print_diff(outcome: &DiffOutcome, tolerance: f64) {
